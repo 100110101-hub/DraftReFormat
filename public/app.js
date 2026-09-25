@@ -68,7 +68,11 @@ function currentImage() { return state.images.find((image) => image.id === state
 function selectedRegion() { const image = currentImage(); return image?.regions.find((region) => region.id === state.selectedRegionId) || null; }
 function snapshot() { return JSON.stringify({ images: state.images, currentId: state.currentId, selectedRegionId: state.selectedRegionId, paintPaths: state.paintPaths, whiteRects: state.whiteRects, layoutWhiteRects: state.layoutWhiteRects, layoutPaintPaths: state.layoutPaintPaths }); }
 function restoreSnapshot(value) { const parsed = JSON.parse(value); state.images = parsed.images; state.currentId = parsed.currentId; state.selectedRegionId = parsed.selectedRegionId; state.paintPaths = parsed.paintPaths || {}; state.whiteRects = parsed.whiteRects || {}; state.layoutWhiteRects = parsed.layoutWhiteRects || []; state.layoutPaintPaths = parsed.layoutPaintPaths || []; render(); }
-function pushHistory() { state.history.push(snapshot()); if (state.history.length > 35) state.history.shift(); state.redo = []; }
+function pushHistory() {
+  const image = currentImage();
+  if (image?.supervisionPending && !image.applyingSupervision) image.supervisionUserEdited = true;
+  state.history.push(snapshot()); if (state.history.length > 35) state.history.shift(); state.redo = [];
+}
 function undo() { if (!state.history.length) return showToast("没有可撤销的操作", "warn"); state.redo.push(snapshot()); restoreSnapshot(state.history.pop()); }
 function redo() { if (!state.redo.length) return showToast("没有可重做的操作", "warn"); state.history.push(snapshot()); restoreSnapshot(state.redo.pop()); }
 
@@ -308,6 +312,47 @@ async function handleHtmlFiles(files) {
 function fileToDataUrl(file) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(file); }); }
 function formatBytes(bytes) { if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`; return `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 
+function applyAnalysisResult(image, result) {
+  pushHistory();
+  image.regions = (result.regions || []).map((region, index) => ({ ...region, id: region.id || `region-${Date.now()}-${index}`, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null, userMoved: false }));
+  image.previewReady = false;
+  image.analyzed = true;
+  image.supervisionPending = !!result.jobId;
+  image.supervisionJobId = result.jobId || null;
+  image.supervisionUserEdited = false;
+  state.lastAnalyzed = "刚刚";
+  state.lastSupervision = result.supervision || null;
+  if (state.currentId === image.id) state.selectedRegionId = image.regions[0]?.id || null;
+  render();
+}
+
+function watchSupervision(image, jobId) {
+  if (!jobId) return;
+  const poll = async () => {
+    if (!image.supervisionPending || image.supervisionJobId !== jobId) return;
+    try {
+      const response = await fetch(`/api/segment-status?jobId=${encodeURIComponent(jobId)}`);
+      if (!response.ok) throw new Error("监督任务暂时不可用");
+      const result = await response.json();
+      if (result.status !== "complete") return setTimeout(poll, 2500);
+      image.supervisionPending = false;
+      image.supervisionJobId = null;
+      if (image.supervisionUserEdited) {
+        image.supervisionResult = result;
+        if (state.currentId === image.id) showToast("监督审校已完成；检测到你已手动修改，未覆盖当前编辑", "warn");
+        return;
+      }
+      image.applyingSupervision = true;
+      applyAnalysisResult(image, { regions: result.regions || image.regions, supervision: result.supervision || null });
+      image.applyingSupervision = false;
+      if (state.currentId === image.id) showToast(`后台监督审校完成（${result.supervision?.rounds || 1} 轮）`, result.supervision?.status === "pass" ? "success" : "warn");
+    } catch {
+      setTimeout(poll, 4000);
+    }
+  };
+  setTimeout(poll, 1200);
+}
+
 async function segmentCurrent() {
   const image = currentImage(); if (!image) return showToast("请先选择一张图片", "warn");
   const button = $("#segmentButton"); button.disabled = true; button.innerHTML = '<span class="spinner"></span>正在理解语义…';
@@ -315,7 +360,13 @@ async function segmentCurrent() {
     let result;
     if (image.src.startsWith("data:image/")) { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); }
     else { result = { regions: structuredClone(demoRegions), source: "offline" }; }
-    pushHistory(); image.regions = (result.regions || []).map((region, index) => ({ ...region, id: region.id || `region-${Date.now()}-${index}`, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null, userMoved: false })); image.previewReady = false; image.analyzed = true; state.lastAnalyzed = "刚刚"; state.lastSupervision = result.supervision || null; state.selectedRegionId = image.regions[0]?.id || null; render(); showToast(result.source === "qwen-supervised" ? `Qwen 分割 + 监督审校完成（${result.supervision?.rounds || 1} 轮）` : "已使用离线演示分区（可继续手动调整）", result.source === "qwen-supervised" ? "success" : "warn");
+    applyAnalysisResult(image, result);
+    if (result.jobId) {
+      showToast("首轮分区已返回，监督审校在后台继续", "success");
+      watchSupervision(image, result.jobId);
+    } else {
+      showToast(result.source === "qwen-supervised" ? `Qwen 分割 + 监督审校完成（${result.supervision?.rounds || 1} 轮）` : "已使用离线演示分区（可继续手动调整）", result.source === "qwen-supervised" ? "success" : "warn");
+    }
   } catch (error) { showToast(error.message || "分析失败，请稍后重试", "error"); }
   finally { button.disabled = false; button.innerHTML = "<span>✦</span>分析当前图片"; }
 }
@@ -328,7 +379,7 @@ async function segmentAll() {
   try {
     for (const image of candidates) {
       state.currentId = image.id; render();
-      try { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); image.regions = (result.regions || []).map((region) => ({ ...region, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null })); image.previewReady = false; image.analyzed = true; completed++; } catch { image.regions = structuredClone(demoRegions).map((region) => ({ ...region, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null })); image.previewReady = false; image.analyzed = true; completed++; }
+      try { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); applyAnalysisResult(image, result); if (result.jobId) watchSupervision(image, result.jobId); completed++; } catch { image.regions = structuredClone(demoRegions).map((region) => ({ ...region, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null })); image.previewReady = false; image.analyzed = true; completed++; }
     }
     render(); showToast(`已完成 ${completed} 张图片的语义分区`, "success");
   } finally { batchButton.disabled = false; batchButton.textContent = "批量分析素材队列"; }

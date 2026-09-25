@@ -14,7 +14,9 @@ import re
 import socket
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -58,6 +60,8 @@ QWEN_ENDPOINT = os.environ.get(
 )
 QWEN_REQUEST_TIMEOUT = float(os.environ.get("QWEN_REQUEST_TIMEOUT", "180"))
 QWEN_LAST_ERROR = ""
+QWEN_JOBS: dict[str, dict[str, Any]] = {}
+QWEN_JOBS_LOCK = threading.Lock()
 
 
 def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
@@ -281,21 +285,75 @@ def supervise_regions(model_image: str, proposal: list[dict[str, Any]]) -> tuple
     return current, audit, False
 
 
-def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+def prepare_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str, dict[str, Any], str | None]:
+    """Run the first segmentation request and return a coordinate proposal."""
+
     api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
     if not api_key:
-        return heuristic_regions(), "offline", {"status": "offline", "rounds": 0, "issues": ["未配置 API key"]}
+        return heuristic_regions(), "offline", {"status": "offline", "rounds": 0, "issues": ["未配置 API key"]}, None
 
     model_image = add_coordinate_grid(image_data_url)
     parsed, error = qwen_request(model_image, segmentation_prompt(hint))
     if not parsed:
         print(f"Qwen request failed, using offline layout: {error}")
-        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [error or "初次分割失败"]}
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [error or "初次分割失败"]}, model_image
     proposal = parsed.get("regions", parsed if isinstance(parsed, list) else [])
     if not isinstance(proposal, list) or not proposal:
-        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no regions"]}
-    regions, audit, passed = supervise_regions(model_image, normalize_regions(proposal))
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no regions"]}, model_image
+    return normalize_regions(proposal), "qwen-initial", {"status": "pending", "rounds": 0, "audit": []}, model_image
+
+
+def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    """Run segmentation and supervision synchronously for CLI/benchmark callers."""
+
+    regions, source, supervision, model_image = prepare_qwen(image_data_url, hint)
+    if source != "qwen-initial" or not model_image:
+        return regions, source, supervision
+    regions, audit, passed = supervise_regions(model_image, regions)
     return regions, "qwen-supervised", {"status": "pass" if passed else "max-rounds", "rounds": len(audit), "audit": audit}
+
+
+def start_supervision_job(model_image: str, proposal: list[dict[str, Any]]) -> str:
+    """Continue supervision in the background so the first proposal is visible immediately."""
+
+    job_id = f"segment-{uuid.uuid4().hex}"
+    with QWEN_JOBS_LOCK:
+        if len(QWEN_JOBS) > 100:
+            oldest = next(iter(QWEN_JOBS))
+            QWEN_JOBS.pop(oldest, None)
+        QWEN_JOBS[job_id] = {
+            "status": "pending",
+            "regions": normalize_regions(proposal),
+            "supervision": {"status": "pending", "rounds": 0, "audit": []},
+        }
+    thread = threading.Thread(target=_run_supervision_job, args=(job_id, model_image, proposal), daemon=True)
+    thread.start()
+    return job_id
+
+
+def _run_supervision_job(job_id: str, model_image: str, proposal: list[dict[str, Any]]) -> None:
+    try:
+        regions, audit, passed = supervise_regions(model_image, proposal)
+        status = "pass" if passed else "max-rounds"
+        if audit and audit[-1].get("status") == "error":
+            status = "error"
+        result = {"status": status, "rounds": len(audit), "audit": audit}
+        with QWEN_JOBS_LOCK:
+            if job_id in QWEN_JOBS:
+                QWEN_JOBS[job_id].update({"status": "complete", "regions": regions, "supervision": result})
+    except Exception as exc:
+        with QWEN_JOBS_LOCK:
+            if job_id in QWEN_JOBS:
+                QWEN_JOBS[job_id].update({
+                    "status": "complete",
+                    "supervision": {"status": "error", "rounds": 0, "audit": [{"status": "error", "issues": [str(exc)]}]},
+                })
+
+
+def get_supervision_job(job_id: str) -> dict[str, Any] | None:
+    with QWEN_JOBS_LOCK:
+        job = QWEN_JOBS.get(job_id)
+        return dict(job) if job else None
 
 
 def normalize_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -364,6 +422,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/health":
             json_response(self, {"ok": True, "model": QWEN_MODEL, "configured": bool(os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")), "lastQwenError": QWEN_LAST_ERROR or None})
             return
+        parsed_url = urllib.parse.urlsplit(self.path)
+        if parsed_url.path == "/api/segment-status":
+            job_id = urllib.parse.parse_qs(parsed_url.query).get("jobId", [""])[0]
+            job = get_supervision_job(job_id)
+            if not job:
+                json_response(self, {"error": "分析任务不存在或已过期"}, 404)
+                return
+            json_response(self, {"jobId": job_id, **job})
+            return
         path = self.path.split("?", 1)[0]
         if path == "/":
             path = "/index.html"
@@ -386,8 +453,13 @@ class Handler(BaseHTTPRequestHandler):
                 image = str(payload.get("image", ""))
                 if not image.startswith("data:image/"):
                     raise ValueError("需要一个图片 data URL")
-                regions, source, supervision = call_qwen(image, str(payload.get("hint", "")))
-                json_response(self, {"regions": regions, "source": source, "model": QWEN_MODEL, "supervision": supervision})
+                regions, source, supervision, model_image = prepare_qwen(image, str(payload.get("hint", "")))
+                response: dict[str, Any] = {"regions": regions, "source": source, "model": QWEN_MODEL, "supervision": supervision}
+                if source == "qwen-initial" and model_image:
+                    job_id = start_supervision_job(model_image, regions)
+                    response["jobId"] = job_id
+                    response["supervision"] = {**supervision, "jobId": job_id}
+                json_response(self, response)
                 return
             if self.path == "/api/import-url":
                 result = import_url(str(payload.get("url", "")))

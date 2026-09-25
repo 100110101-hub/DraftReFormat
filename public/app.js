@@ -412,56 +412,192 @@ function saveProject() { const images = state.images.map((image) => ({ ...image,
 async function exportFinal() {
   if (!state.images.length) return showToast("请先加入图片素材", "warn");
   const button = $("#exportButton"); button.disabled = true; setProcessingStatus("正在生成终稿…"); showToast("正在整理分页，编号集合不会被拆开…", "success");
-  try { const html = await buildExportHtml(); const output = window.open("", "_blank"); if (!output) throw new Error("浏览器拦截了预览窗口，请允许弹窗"); output.document.write(html); output.document.close(); } catch (error) { setProcessingStatus("导出失败"); showToast(error.message || "导出失败", "error"); } finally { button.disabled = false; }
+  try { const html = await buildExportHtml(); const output = window.open("", "_blank"); if (!output) throw new Error("浏览器拦截了预览窗口，请允许弹窗"); output.document.write(html); output.document.close(); setProcessingStatus("终稿预览已打开"); } catch (error) { setProcessingStatus("导出失败"); showToast(error.message || "导出失败", "error"); } finally { button.disabled = false; }
 }
 
 async function buildExportHtml() {
-  const blocks = [];
+  const entries = [];
   const totalImages = state.images.length;
   let imageIndex = 0;
+  let fallbackY = 28;
   for (const image of state.images) {
     imageIndex += 1;
     setProcessingStatus("正在裁剪第 " + imageIndex + "/" + totalImages + " 张素材…");
-    const groups = new Map();
+    if (!image.sourceWidth || !image.sourceHeight) {
+      const size = await imageSize(image.src);
+      image.sourceWidth = size.width;
+      image.sourceHeight = size.height;
+      image.aspect = size.width && size.height ? size.width / size.height : .72;
+      image.displayScale = Math.min(1, 760 / Math.max(1, image.sourceWidth));
+    }
     const keptRegions = image.regions.filter((region) => region.editAction !== "delete");
-    const regions = keptRegions.length ? keptRegions : (image.regions.length ? [] : [{ id: "full", label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, group: "未分组", confidence: 1 }]);
-    regions.forEach((region) => { const key = state.keepGroups ? (region.group || region.id) : region.id; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(region); });
-    for (const [group, groupRegions] of groups) {
-      const crops = [];
-      for (const region of groupRegions) crops.push({ region, src: region.cropSrc || await cropRegion(image, region) });
-      blocks.push({ group, image, regions: crops, y: Math.min(...groupRegions.map((region) => region.layoutY || 0)), height: groupRegions.reduce((sum, region) => sum + (region.layoutH || region.h * 8), 0) });
+    const regions = keptRegions.length ? keptRegions : (image.regions.length ? [] : [image.syntheticRegion || { id: "full", label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, group: "未分组", confidence: 1 }]);
+    for (const region of regions) {
+      const sourceWidth = image.sourceWidth || 760;
+      const sourceHeight = image.sourceHeight || Math.round(sourceWidth / (image.aspect || .72));
+      const scale = image.displayScale || Math.min(1, 760 / Math.max(1, sourceWidth));
+      if (!Number.isFinite(region.layoutW) || !Number.isFinite(region.layoutH) || region.layoutW <= 0 || region.layoutH <= 0) {
+        region.layoutW = Math.max(1, Math.round(sourceWidth * (Number(region.w) || 100) / 100 * scale));
+        region.layoutH = Math.max(1, Math.round(sourceHeight * (Number(region.h) || 100) / 100 * scale));
+      }
+      if (!Number.isFinite(region.layoutX)) region.layoutX = 28;
+      if (!Number.isFinite(region.layoutY)) region.layoutY = fallbackY;
+      fallbackY = Math.max(fallbackY, region.layoutY + region.layoutH + 24);
+      const group = state.keepGroups ? (region.group || region.id) : region.id;
+      entries.push({ group, image, region, src: region.cropSrc || await cropRegion(image, region), order: entries.length });
     }
   }
-  setProcessingStatus("正在按集合分页（每个集合保持完整）…");
-  blocks.sort((a, b) => a.y - b.y);
+  setProcessingStatus("正在按终端画布顺序整理集合分页…");
+  entries.sort((a, b) => (a.region.layoutY || 0) - (b.region.layoutY || 0) || (a.region.layoutX || 0) - (b.region.layoutX || 0) || a.order - b.order);
+  // A collection occupies one page. Collection order follows its first appearance
+  // on the long terminal canvas, while blocks inside it retain their canvas coords.
+  const collections = new Map();
+  entries.forEach((entry) => {
+    if (!collections.has(entry.group)) collections.set(entry.group, []);
+    collections.get(entry.group).push(entry);
+  });
+  const pageGroups = [...collections.values()];
   const size = $("#pageSize").value;
   const dimensions = { a4: [794, 1123], a3: [1123, 1587], letter: [816, 1056] };
   const [pageWidth, pageHeight] = dimensions[size] || dimensions.a4;
-  const pages = [];
-  let page = [];
-  let used = 0;
-  blocks.forEach((block) => {
-    const blockHeight = Math.max(1, Math.min(pageHeight, block.height));
-    if (page.length && used + blockHeight > pageHeight) { pages.push(page); page = []; used = 0; }
-    page.push(block);
-    used += blockHeight;
-  });
-  if (page.length) pages.push(page);
-  const pagesHtml = pages.map((items) => items.map((block) => {
-    const blocksHtml = block.regions.map((item) => { const width = item.region.layoutW ? ' style="width:' + item.region.layoutW + 'px;max-width:100%;height:auto"' : ''; return '<article class="print-block"><img' + width + ' src="' + item.src + '" alt="" /></article>'; }).join('');
-    return '<section class="print-group" aria-label="集合 ' + escapeHtml(block.group) + '">' + blocksHtml + '</section>';
-  }).join('')).map((groupsHtml) => '<section class="print-page">' + groupsHtml + '</section>').join('');
-  setProcessingStatus("正在打开纯内容 PDF 预览（" + pages.length + " 页）…");
+  const pagesHtml = pageGroups.map((items) => {
+    const groupTop = Math.min(...items.map((item) => item.region.layoutY || 0));
+    const groupBottom = Math.max(...items.map((item) => (item.region.layoutY || groupTop) + (item.region.layoutH || 1)));
+    const groupHeight = Math.max(1, groupBottom - groupTop + 4);
+    const blocksHtml = items.map((item) => {
+      const region = item.region;
+      const left = Math.max(0, Math.round(Number.isFinite(region.layoutX) ? region.layoutX : 28));
+      const top = Math.max(0, Math.round((Number.isFinite(region.layoutY) ? region.layoutY : groupTop) - groupTop));
+      const width = Math.max(1, Math.round(Number.isFinite(region.layoutW) ? region.layoutW : 1));
+      const height = Math.max(1, Math.round(Number.isFinite(region.layoutH) ? region.layoutH : 1));
+      return '<article class="print-block" style="left:' + left + 'px;top:' + top + 'px;width:' + width + 'px;height:' + height + 'px"><img src="' + escapeHtml(item.src) + '" alt="' + escapeHtml(region.label || '') + '" style="width:' + width + 'px;height:' + height + 'px" /></article>';
+    }).join('');
+    const whiteouts = state.layoutWhiteRects.map((rect) => {
+      const left = Number(rect.x) || 0;
+      const top = (Number(rect.y) || 0) - groupTop;
+      return '<div class="print-whiteout" style="left:' + left + 'px;top:' + top + 'px;width:' + Math.max(0, Number(rect.w) || 0) + 'px;height:' + Math.max(0, Number(rect.h) || 0) + 'px"></div>';
+    }).join('');
+    const brushPaths = state.layoutPaintPaths.map((path) => {
+      const points = (path.points || []).map((point) => `${Number(point.x) || 0},${(Number(point.y) || 0) - groupTop}`).join(' ');
+      return points ? '<polyline points="' + points + '" />' : '';
+    }).join('');
+    const overlay = (whiteouts || brushPaths) ? '<div class="print-overlays">' + whiteouts + '</div><svg class="print-brush-overlays" width="' + pageWidth + '" height="' + groupHeight + '" viewBox="0 0 ' + pageWidth + ' ' + groupHeight + '">' + brushPaths + '</svg>' : '';
+    return '<section class="print-page"><div class="print-group" data-group="' + escapeHtml(items[0].group) + '" style="height:' + groupHeight + 'px">' + blocksHtml + overlay + '</div></section>';
+  }).join('');
+  setProcessingStatus("正在打开纯内容 PDF 预览（" + pageGroups.length + " 页）…");
   const css = '@page{size:' + size + ' portrait;margin:0}' +
     '*{box-sizing:border-box}' +
     'html,body{margin:0;padding:0;background:#fff}' +
     '.print-page{width:' + pageWidth + 'px;height:' + pageHeight + 'px;min-height:' + pageHeight + 'px;margin:0;padding:0;overflow:hidden;background:#fff;page-break-after:always;break-after:page}' +
-    '.print-group{margin:0;padding:0;break-inside:avoid;page-break-inside:avoid}' +
-    '.print-block{display:block;margin:0;padding:0;break-inside:avoid;page-break-inside:avoid;line-height:0}' +
-    '.print-block img{display:block;width:auto;height:auto;max-width:100%;max-height:none;object-fit:contain;object-position:left top;border:0;border-radius:0;background:#fff}' +
+    '.print-group{position:relative;width:' + pageWidth + 'px;margin:0;padding:0;break-inside:avoid;page-break-inside:avoid}' +
+    '.print-block{position:absolute;display:block;margin:0;padding:0;line-height:0;break-inside:avoid;page-break-inside:avoid}' +
+    '.print-block img{display:block;max-width:none;max-height:none;object-fit:contain;object-position:left top;border:0;border-radius:0;background:#fff}' +
+    '.print-overlays{position:absolute;inset:0;z-index:20;pointer-events:none;overflow:visible}' +
+    '.print-whiteout{position:absolute;background:#fff}' +
+    '.print-brush-overlays{position:absolute;inset:0;z-index:21;pointer-events:none;overflow:visible}' +
+    '.print-brush-overlays polyline{fill:none;stroke:#fff;stroke-width:8;stroke-linecap:round;stroke-linejoin:round}' +
     '@media screen{.print-page{outline:1px solid #dfe2e8}}';
   return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>' + escapeHtml(state.projectName) + ' · 终稿</title><style>' + css + '</style></head><body>' + pagesHtml + '<script>setTimeout(()=>window.print(),600)</script></body></html>';
 }
+
+
+function cropRegion(image, region) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const sourceWidth = img.naturalWidth || 760;
+        const sourceHeight = img.naturalHeight || Math.round(sourceWidth / .72);
+        const x = clamp(Number(region.x) || 0, 0, 100);
+        const y = clamp(Number(region.y) || 0, 0, 100);
+        const w = clamp(Number(region.w) || 100, 1, 100 - x);
+        const h = clamp(Number(region.h) || 100, 1, 100 - y);
+        const sx = sourceWidth * x / 100;
+        const sy = sourceHeight * y / 100;
+        const sw = Math.max(1, sourceWidth * w / 100);
+        const sh = Math.max(1, sourceHeight * h / 100);
+        const scale = Math.min(1, 1200 / Math.max(sw, sh));
+        const width = Math.max(1, Math.round(sw * scale));
+        const height = Math.max(1, Math.round(sh * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, width, height);
+        const polygon = Array.isArray(region.polygon) && region.polygon.length >= 3 ? region.polygon : null;
+        ctx.save();
+        if (polygon) {
+          ctx.beginPath();
+          polygon.forEach((point, index) => {
+            const px = ((Number(point[0]) - x) / w) * width;
+            const py = ((Number(point[1]) - y) / h) * height;
+            index ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+          });
+          ctx.closePath();
+          ctx.clip();
+        }
+        ctx.drawImage(img, sx, sy, sw, sh, 0, 0, width, height);
+        ctx.restore();
+        drawCropWhiteouts(ctx, image, region, width, height);
+        (region.holes || []).forEach((hole) => drawCropHole(ctx, hole, region, width, height));
+        resolve(canvas.toDataURL("image/png"));
+      } catch {
+        resolve(image.src);
+      }
+    };
+    img.onerror = () => resolve(image.src);
+    img.src = image.src;
+  });
+}
+
+function drawCropHole(ctx, hole, region, width, height) {
+  ctx.save();
+  ctx.fillStyle = "#fff";
+  if (Array.isArray(hole?.polygon) && hole.polygon.length >= 3) {
+    ctx.beginPath();
+    hole.polygon.forEach((point, index) => {
+      const px = ((Number(point[0]) - region.x) / region.w) * width;
+      const py = ((Number(point[1]) - region.y) / region.h) * height;
+      index ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.closePath();
+    ctx.fill();
+  } else {
+    const x = ((Number(hole?.x) || 0) - region.x) / region.w * width;
+    const y = ((Number(hole?.y) || 0) - region.y) / region.h * height;
+    const w = (Number(hole?.w) || 0) / region.w * width;
+    const h = (Number(hole?.h) || 0) / region.h * height;
+    ctx.fillRect(x, y, w, h);
+  }
+  ctx.restore();
+}
+
+function drawCropWhiteouts(ctx, image, region, width, height) {
+  (state.whiteRects[image.id] || []).forEach((item) => {
+    const x = (item.x - region.x) / region.w * width;
+    const y = (item.y - region.y) / region.h * height;
+    const w = item.w / region.w * width;
+    const h = item.h / region.h * height;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(x, y, w, h);
+  });
+  (state.paintPaths[image.id] || []).forEach((path) => {
+    if (!path.points?.length) return;
+    ctx.strokeStyle = "#fff";
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = (path.size || 8) / region.w * width;
+    ctx.beginPath();
+    path.points.forEach((point, index) => {
+      const x = (point.x - region.x) / region.w * width;
+      const y = (point.y - region.y) / region.h * height;
+      index ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+  });
+}
+
 
 function escapeHtml(value) { return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character])); }
 function setProcessingStatus(message) { const node = $("#processingStatus"); if (node) node.textContent = message; }

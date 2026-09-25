@@ -4,8 +4,9 @@
 
 ## 启动
 
-1. 复制 `.env.example` 为 `.env`，填入 `DASHSCOPE_API_KEY`。
-2. 运行 `python server.py`。
+1. 安装依赖：`python -m pip install -r requirements.txt`。
+2. 复制 `.env.example` 为 `.env`，填入 `DASHSCOPE_API_KEY`。
+3. 运行 `python server.py`。
 3. 打开 `http://127.0.0.1:8765`。
 
-默认视觉模型为 `qwen-vl-max`，可用 `QWEN_MODEL` 覆盖。
+默认视觉模型为 `qwen-3.6-plus`，可用 `QWEN_MODEL` 覆盖。发送给 Qwen 的临时分析图会叠加 10% 坐标网格和刻度，模型返回的坐标仍映射到无网格原图；网格不会出现在终稿中。

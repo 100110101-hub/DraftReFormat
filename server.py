@@ -14,16 +14,22 @@ import re
 import threading
 import urllib.error
 import urllib.request
+from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # Pillow is optional for the offline demo, required for grid hints.
+    Image = ImageDraw = ImageFont = None
 
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC = ROOT / "public"
 HOST = os.environ.get("DRAFT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DRAFT_PORT", "8765"))
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-vl-max")
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-3.6-plus")
 QWEN_ENDPOINT = os.environ.get(
     "QWEN_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 )
@@ -128,11 +134,54 @@ def heuristic_regions() -> list[dict[str, Any]]:
     ]
 
 
+def add_coordinate_grid(image_data_url: str) -> str:
+    """Overlay a light 10% coordinate grid while keeping the same aspect ratio.
+
+    The grid is only sent to the vision model.  The browser keeps the original
+    image, so grid lines and labels never appear in the final crop.
+    """
+
+    if Image is None or os.environ.get("QWEN_GRID", "1").lower() in {"0", "false", "off"}:
+        return image_data_url
+    try:
+        header, encoded = image_data_url.split(",", 1)
+        raw = base64.b64decode(encoded)
+        source = Image.open(BytesIO(raw)).convert("RGB")
+        # Keep payloads manageable while preserving percentage coordinates.
+        source.thumbnail((2600, 2600), Image.Resampling.LANCZOS)
+        base = source.convert("RGBA")
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        font = ImageFont.load_default()
+        width, height = base.size
+        for index in range(0, 11):
+            x = round(width * index / 10)
+            y = round(height * index / 10)
+            major = index in {0, 5, 10}
+            line_color = (42, 114, 181, 170 if major else 105)
+            draw.line((x, 0, x, height), fill=line_color, width=2 if major else 1)
+            draw.line((0, y, width, y), fill=line_color, width=2 if major else 1)
+            label = str(index * 10)
+            if index < 10:
+                draw.rectangle((x + 2, 2, x + 22, 13), fill=(255, 255, 255, 205))
+                draw.text((x + 4, 3), label, font=font, fill=(23, 78, 128, 255))
+                draw.rectangle((2, max(2, y - 7), 24, y + 5), fill=(255, 255, 255, 205))
+                draw.text((4, max(2, y - 6)), label, font=font, fill=(23, 78, 128, 255))
+        result = Image.alpha_composite(base, overlay).convert("RGB")
+        output = BytesIO()
+        result.save(output, format="JPEG", quality=92, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    except Exception as exc:
+        print(f"Grid overlay skipped: {exc}")
+        return image_data_url
+
+
 def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str]:
     api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
     if not api_key:
         return heuristic_regions(), "offline"
 
+    model_image = add_coordinate_grid(image_data_url)
     prompt = f"""你是文档版面分析与语义分割专家。请分析这张草稿截图，给出适合后续编辑和分页的语义区域。
 要求：
 1. 这是“裁剪区域”识别，不是给整页画几个大框。每个题号、段落、图表、结构式、公式都要成为独立且紧致的内容块，尽量贴合可见内容，排除周围空白；相邻内容只有在语义上不可分时才合并。
@@ -142,6 +191,7 @@ def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]]
 4. 坐标为相对于原图的百分比 0-100，x/y 是左上角，w/h 是宽高；只输出 JSON，不要 Markdown。
 5. label 使用简短中文，kind 只能是 text/image/table/chemistry/biology/formula/other。
 6. 过滤页眉、页脚、装饰线和大面积空白；对每个真实内容给出边界，至少保留一个主内容区域。
+7. 图片上叠加了蓝色 10% 坐标网格和刻度，左上角为 (0,0)，右下角为 (100,100)。网格、刻度数字不是内容，必须忽略它们；输出坐标仍对应没有网格的原始图片。
 用户补充：{hint or '无'}
 输出格式：{{\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""
     payload = {
@@ -151,7 +201,7 @@ def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]]
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                    {"type": "image_url", "image_url": {"url": model_image}},
                     {"type": "text", "text": prompt},
                 ],
             }

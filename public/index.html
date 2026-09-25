@@ -54,18 +54,18 @@
               <div class="section-heading"><span>素材队列</span><button id="sortImages" class="text-button">按编号排序</button></div>
               <div class="asset-list" id="assetList"></div>
             </section>
+          </div>
 
-            <section class="side-section ai-section">
+          <section class="side-section ai-section">
               <div class="section-heading"><span>语义分区</span><span class="ai-chip">QWEN VISION</span></div>
               <div class="ai-card">
-                <div class="ai-card-top"><div class="qwen-orb">✦</div><div><strong>自动识别内容块</strong><span id="modelName">qwen-3.6-plus · 网格辅助</span></div><div class="toggle on" id="autoSaveToggle"><i></i></div></div>
+                <div class="ai-card-top"><div class="qwen-orb">✦</div><div><strong>自动识别内容块</strong><span id="modelName">qwen-3.6-plus · 数值坐标辅助</span></div><div class="toggle on" id="autoSaveToggle"><i></i></div></div>
                 <p>理解题目、图表、化学结构式、生物图片与编号关系，生成可编辑的语义边界。</p>
                 <button class="ai-run-button" id="segmentButton"><span>✦</span>分析当前图片</button>
                 <button class="ai-batch-button" id="segmentAllButton">批量分析素材队列</button>
               </div>
               <div class="legend-row"><span><i class="legend-swatch text"></i>文字</span><span><i class="legend-swatch image"></i>图片</span><span><i class="legend-swatch formula"></i>公式</span><span><i class="legend-swatch group"></i>编号集合</span></div>
-            </section>
-          </div>
+          </section>
           <div class="sidebar-footer"><div class="privacy-mark">⌁</div><div><strong>本地优先</strong><span>图片只在分析时发送到 Qwen</span></div><button class="icon-button">?</button></div>
         </aside>
 

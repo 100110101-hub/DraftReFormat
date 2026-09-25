@@ -21,7 +21,7 @@ from typing import Any
 
 try:
     from PIL import Image, ImageDraw, ImageFont
-except ImportError:  # Pillow is optional for the offline demo, required for grid hints.
+except ImportError:  # Pillow is optional for the offline demo, required for coordinate hints.
     Image = ImageDraw = ImageFont = None
 
 
@@ -135,13 +135,15 @@ def heuristic_regions() -> list[dict[str, Any]]:
 
 
 def add_coordinate_grid(image_data_url: str) -> str:
-    """Overlay a light 10% coordinate grid while keeping the same aspect ratio.
+    """Expand the image and add numeric coordinate axes, without grid lines.
 
-    The grid is only sent to the vision model.  The browser keeps the original
-    image, so grid lines and labels never appear in the final crop.
+    The original image is placed inside a white coordinate frame. Only tick
+    marks and values (0..100) sit outside the content, so Qwen can read exact
+    numeric positions without mistaking grid lines for document content.
     """
 
-    if Image is None or os.environ.get("QWEN_GRID", "1").lower() in {"0", "false", "off"}:
+    frame_enabled = os.environ.get("QWEN_COORDINATE_FRAME", os.environ.get("QWEN_GRID", "1"))
+    if Image is None or frame_enabled.lower() in {"0", "false", "off"}:
         return image_data_url
     try:
         header, encoded = image_data_url.split(",", 1)
@@ -149,41 +151,45 @@ def add_coordinate_grid(image_data_url: str) -> str:
         source = Image.open(BytesIO(raw)).convert("RGB")
         # Keep payloads manageable while preserving percentage coordinates.
         source.thumbnail((2600, 2600), Image.Resampling.LANCZOS)
-        base = source.convert("RGBA")
-        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
+        source = source.convert("RGB")
+        width, height = source.size
+        pad_left, pad_top, pad_right, pad_bottom = 76, 52, 28, 34
+        canvas = Image.new("RGB", (width + pad_left + pad_right, height + pad_top + pad_bottom), "white")
+        canvas.paste(source, (pad_left, pad_top))
+        draw = ImageDraw.Draw(canvas)
         font = ImageFont.load_default()
-        width, height = base.size
+        x0, y0 = pad_left, pad_top
+        x1, y1 = pad_left + width, pad_top + height
+        draw.rectangle((x0, y0, x1, y1), outline=(42, 114, 181), width=2)
+        # Axes are outside the content; there are deliberately no interior lines.
+        draw.line((x0, y0 - 20, x1, y0 - 20), fill=(42, 114, 181), width=2)
+        draw.line((x0 - 20, y0, x0 - 20, y1), fill=(42, 114, 181), width=2)
         for index in range(0, 11):
-            x = round(width * index / 10)
-            y = round(height * index / 10)
-            major = index in {0, 5, 10}
-            line_color = (42, 114, 181, 170 if major else 105)
-            draw.line((x, 0, x, height), fill=line_color, width=2 if major else 1)
-            draw.line((0, y, width, y), fill=line_color, width=2 if major else 1)
+            x = x0 + round(width * index / 10)
+            y = y0 + round(height * index / 10)
             label = str(index * 10)
-            if index < 10:
-                draw.rectangle((x + 2, 2, x + 22, 13), fill=(255, 255, 255, 205))
-                draw.text((x + 4, 3), label, font=font, fill=(23, 78, 128, 255))
-                draw.rectangle((2, max(2, y - 7), 24, y + 5), fill=(255, 255, 255, 205))
-                draw.text((4, max(2, y - 6)), label, font=font, fill=(23, 78, 128, 255))
-        result = Image.alpha_composite(base, overlay).convert("RGB")
+            draw.line((x, y0 - 25, x, y0 - 15), fill=(42, 114, 181), width=2)
+            draw.text((x - 7, y0 - 42), label, font=font, fill=(23, 78, 128))
+            draw.line((x0 - 25, y, x0 - 15, y), fill=(42, 114, 181), width=2)
+            draw.text((x0 - 63, y - 5), label, font=font, fill=(23, 78, 128))
+        draw.text((x1 + 5, y0 - 25), "X", font=font, fill=(23, 78, 128))
+        draw.text((x0 - 22, y1 + 8), "Y", font=font, fill=(23, 78, 128))
         output = BytesIO()
-        result.save(output, format="JPEG", quality=92, optimize=True)
+        canvas.save(output, format="JPEG", quality=94, optimize=True)
         return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
     except Exception as exc:
         print(f"Grid overlay skipped: {exc}")
         return image_data_url
 
 
-def qwen_request(model_image: str, prompt: str) -> tuple[dict[str, Any] | None, str | None]:
+def qwen_request(model_image: str, prompt: str, model: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
     """Make one structured request to the configured Qwen vision model."""
 
     api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
     if not api_key:
         return None, "API key is not configured"
     payload = {
-        "model": QWEN_MODEL,
+        "model": model or QWEN_MODEL,
         "temperature": 0.05,
         "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": model_image}}, {"type": "text", "text": prompt}]}],
     }
@@ -209,7 +215,7 @@ def segmentation_prompt(hint: str = "") -> str:
 5. 坐标为相对于原图的百分比 0-100，x/y 是左上角，w/h 是宽高；只输出 JSON，不要 Markdown。
 6. label 使用简短中文，kind 只能是 text/image/table/chemistry/biology/formula/other。
 7. 过滤页眉、页脚、装饰线和大面积空白；对每个真实内容给出边界，至少保留一个主内容区域。
-8. 图片上叠加了蓝色 10% 坐标网格和刻度，左上角为 (0,0)，右下角为 (100,100)。网格、刻度数字不是内容，必须忽略；输出坐标仍对应没有网格的原始图片。
+8. 原图被放在白色坐标框内，外侧只有蓝色坐标轴、刻度和 0..100 数值，没有内部网格线。内容框左上角对应 (0,0)，右下角对应 (100,100)。坐标轴、刻度和白色扩展区不是内容，必须忽略；输出坐标仍对应没有坐标框的原始图片。
 用户补充：{hint or '无'}
 输出格式：{{\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""
 
@@ -219,14 +225,16 @@ def supervise_regions(model_image: str, proposal: list[dict[str, Any]]) -> tuple
 
     current = proposal
     audit: list[dict[str, Any]] = []
-    max_rounds = max(1, min(3, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "3"))))
+    # Keep retrying until the supervisor passes, with a conservative hard cap
+    # so a malformed model response cannot create an unbounded bill/loop.
+    max_rounds = max(1, min(6, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "5"))))
     for round_number in range(1, max_rounds + 1):
         review_prompt = f"""你是严格的版面分割监督审校 agent。请检查候选区域是否覆盖图片中所有真实内容，并指出漏块、误合并、边界过松/过紧、截断结构式或错误编号集合。
 监督标准：
 1. 每个可独立阅读或编辑的内容都必须有一个区域，小图注、化学键、公式、题号不能丢。
 2. 区域必须紧贴内容，不能把大块空白或无关内容放入同一个框。
 3. 不能切断相互连接的公式、化学结构式、表格、图片和图注。
-4. 坐标使用原图百分比 0-100，网格与刻度不属于内容。
+4. 坐标使用原图百分比 0-100，外侧坐标轴、刻度和白色扩展区不属于内容。
 如果不通过，直接给出修正后的完整 regions 数组，而不是只描述问题。只有确实满足标准时 status 才能是 pass。
 候选 regions：{json.dumps(current, ensure_ascii=False)}
 只输出 JSON：{{\"status\":\"pass\"或\"revise\",\"issues\":[\"...\"],\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""

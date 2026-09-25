@@ -29,6 +29,16 @@
 .tile-delete { position: absolute; right: 7px; top: 7px; width: 19px; height: 19px; border-radius: 4px; color: #fff; background: rgba(54, 34, 47, .86); font-size: 15px; line-height: 17px; opacity: 0; z-index: 2; }
 .region-tile:hover .tile-delete, .region-tile.selected .tile-delete { opacity: 1; }
 .tile-delete:hover { background: #a94e64; }
+
+/* Keep both sidebars and the middle canvas in their own scroll contexts. */
+.workspace { min-height: 0; height: calc(100vh - 64px); overflow: hidden; }
+.main-stage { min-height: 0; height: 100%; overflow: hidden; }
+.canvas-area { min-height: 0; height: 0; flex: 1 1 auto; overflow-x: auto; overflow-y: scroll; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.canvas-wrap { flex: 0 0 auto; height: auto; min-height: 1120px; }
+.left-sidebar { min-height: 0; overflow: hidden; }
+.left-sidebar .sidebar-scroll { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; }
+.left-sidebar .ai-section { flex: 0 0 auto; min-height: 222px; max-height: 270px; overflow: auto; background: #10131a; }
+.left-sidebar .sidebar-footer { flex: 0 0 53px; }
 .layout-whiteout { position: absolute; z-index: 6; background: #fff; pointer-events: none; }
 .stage-help { bottom: 12px; color: #687384; background: rgba(235, 237, 241, .84); padding: 4px 8px; border-radius: 4px; }
 .asset-item { position: relative; padding-right: 27px; }

@@ -29,11 +29,6 @@ ROOT = Path(__file__).resolve().parent
 PUBLIC = ROOT / "public"
 HOST = os.environ.get("DRAFT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DRAFT_PORT", "8765"))
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-3.6-plus")
-QWEN_ENDPOINT = os.environ.get(
-    "QWEN_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-)
-QWEN_LAST_ERROR = ""
 
 
 def load_dotenv() -> None:
@@ -52,6 +47,15 @@ def load_dotenv() -> None:
 
 
 load_dotenv()
+
+# Read Qwen settings after loading the local .env file.  This keeps explicit
+# process environment variables authoritative while allowing the normal local
+# setup (copying .env.example to .env) to configure the MaaS endpoint.
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-3.6-plus")
+QWEN_ENDPOINT = os.environ.get(
+    "QWEN_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+)
+QWEN_LAST_ERROR = ""
 
 
 def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
@@ -204,6 +208,24 @@ def qwen_request(model_image: str, prompt: str, model: str | None = None) -> tup
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
         QWEN_LAST_ERROR = ""
         return json.loads(clean_json_text(str(content))), None
+    except urllib.error.HTTPError as exc:
+        # Preserve the provider's machine-readable error without ever exposing
+        # the Authorization header or the configured API key.
+        detail = ""
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+            payload = json.loads(raw)
+            error = payload.get("error", payload) if isinstance(payload, dict) else {}
+            if isinstance(error, dict):
+                code = error.get("code") or error.get("type")
+                message = error.get("message")
+                detail = ": ".join(str(value) for value in (code, message) if value)
+            if not detail:
+                detail = raw[:240]
+        except Exception:
+            detail = ""
+        QWEN_LAST_ERROR = f"HTTP {exc.code}" + (f" {detail}" if detail else "")
+        return None, QWEN_LAST_ERROR
     except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
         QWEN_LAST_ERROR = str(exc)
         return None, QWEN_LAST_ERROR

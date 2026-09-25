@@ -102,7 +102,7 @@
             </div>
             <div class="stage-help"><span class="key-hint">空格</span> 平移画布 <span class="key-hint">⌘ Z</span> 撤销 <span class="help-separator"></span> 当前工具：<strong id="toolHint">选择</strong></div>
           </div>
-          <div class="bottom-strip"><div class="strip-stat"><span class="strip-icon">▦</span><span id="regionCount">0 个内容块</span></div><div class="strip-stat"><span class="strip-icon violet">⌁</span><span id="groupCount">0 个编号集合</span></div><div class="strip-stat"><span class="strip-icon amber">◷</span><span>最后分析 <b id="lastAnalyzed">尚未分析</b></span></div><div class="strip-spacer"></div><button class="text-button" id="clearWhiteouts">清除当前涂白</button><button class="text-button danger" id="deleteRegion">删除选中</button></div>
+          <div class="bottom-strip"><div class="strip-stat"><span class="strip-icon">▦</span><span id="regionCount">0 个内容块</span></div><div class="strip-stat"><span class="strip-icon violet">⌁</span><span id="groupCount">0 个编号集合</span></div><div class="strip-stat"><span class="strip-icon amber">◷</span><span>最后分析 <b id="lastAnalyzed">尚未分析</b></span></div><div class="strip-stat processing-stat"><span class="strip-icon">◌</span><span>处理进度 <b id="processingStatus">空闲</b></span></div><div class="strip-spacer"></div><button class="text-button" id="clearWhiteouts">清除当前涂白</button><button class="text-button danger" id="deleteRegion">删除选中</button></div>
         </main>
 
         <aside class="sidebar right-sidebar">
@@ -120,7 +120,7 @@
               <button class="danger-outline" id="removeInspectorRegion">移除该内容块</button>
             </div>
             <div class="divider-line"></div>
-            <section class="output-section"><div class="output-heading"><div><span class="eyebrow">OUTPUT</span><h3>终稿设置</h3></div><span class="ready-pill">READY</span></div><div class="output-row"><span>分页尺寸</span><select id="pageSize"><option value="a4">A4 · 竖版</option><option value="a3">A3 · 竖版</option><option value="letter">Letter · 竖版</option></select></div><div class="output-row"><span>集合不拆页</span><div class="toggle on" id="keepGroupsToggle"><i></i></div></div><div class="output-row"><span>页边距</span><div class="range-wrap"><input id="marginRange" type="range" min="24" max="96" value="48" /><span id="marginValue">48 px</span></div></div><div class="page-flow"><span class="flow-node active">素材</span><i>→</i><span class="flow-node active">分区</span><i>→</i><span class="flow-node">分页</span><i>→</i><span class="flow-node">终稿</span></div><button class="full-export-button" id="inspectorExport"><span>✦</span>生成分页预览</button></section>
+            <section class="output-section"><div class="output-heading"><div><span class="eyebrow">OUTPUT</span><h3>终稿设置</h3></div><span class="ready-pill">READY</span></div><div class="output-row"><span>分页尺寸</span><select id="pageSize"><option value="a4">A4 · 竖版</option><option value="a3">A3 · 竖版</option><option value="letter">Letter · 竖版</option></select></div><div class="output-row"><span>集合不拆页</span><div class="toggle on" id="keepGroupsToggle"><i></i></div></div><div class="output-row"><span>页边距</span><span class="zero-margin">0 px（纯内容）</span></div><div class="page-flow"><span class="flow-node active">素材</span><i>→</i><span class="flow-node active">分区</span><i>→</i><span class="flow-node">分页</span><i>→</i><span class="flow-node">终稿</span></div><button class="full-export-button" id="inspectorExport"><span>✦</span>生成分页预览</button></section>
           </div>
         </aside>
       </div>

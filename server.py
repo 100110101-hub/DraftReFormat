@@ -193,16 +193,60 @@ def add_coordinate_grid(image_data_url: str) -> str:
         return image_data_url
 
 
-def qwen_request(model_image: str, prompt: str, model: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
+def make_candidate_sheet(image_data_url: str, proposal: list[dict[str, Any]]) -> str | None:
+    """Create a compact contact sheet of candidate crops for the supervisor."""
+
+    if Image is None:
+        return None
+    try:
+        _, encoded = image_data_url.split(",", 1)
+        source = Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
+        cards: list[tuple[str, Image.Image]] = []
+        for region in proposal[:40]:
+            x = max(0, min(100, float(region.get("x", 0))))
+            y = max(0, min(100, float(region.get("y", 0))))
+            w = max(1, min(100 - x, float(region.get("w", 1))))
+            h = max(1, min(100 - y, float(region.get("h", 1))))
+            left = round(source.width * x / 100)
+            top = round(source.height * y / 100)
+            right = max(left + 1, round(source.width * (x + w) / 100))
+            bottom = max(top + 1, round(source.height * (y + h) / 100))
+            crop = source.crop((left, top, right, bottom))
+            crop.thumbnail((280, 180), Image.Resampling.LANCZOS)
+            cards.append((str(region.get("id") or len(cards) + 1), crop.copy()))
+        if not cards:
+            return None
+        columns = 3
+        card_width, card_height = 320, 220
+        sheet = Image.new("RGB", (columns * card_width, ((len(cards) + columns - 1) // columns) * card_height), "white")
+        draw = ImageDraw.Draw(sheet)
+        for index, (label, crop) in enumerate(cards):
+            x0 = (index % columns) * card_width
+            y0 = (index // columns) * card_height
+            draw.rectangle((x0, y0, x0 + card_width - 1, y0 + card_height - 1), outline=(190, 198, 210), width=2)
+            draw.text((x0 + 8, y0 + 6), label, fill=(30, 80, 130))
+            sheet.paste(crop, (x0 + (card_width - crop.width) // 2, y0 + 30))
+        output = BytesIO()
+        sheet.save(output, format="JPEG", quality=88, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    except Exception as exc:
+        print(f"Candidate sheet skipped: {exc}")
+        return None
+
+
+def qwen_request(model_image: str | list[str], prompt: str, model: str | None = None) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
     """Make one structured request to the configured Qwen vision model."""
 
     api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
     if not api_key:
         return None, "API key is not configured"
+    images = [model_image] if isinstance(model_image, str) else model_image
+    content = [{"type": "image_url", "image_url": {"url": image}} for image in images]
+    content.append({"type": "text", "text": prompt})
     payload = {
         "model": model or QWEN_MODEL,
         "temperature": 0.05,
-        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": model_image}}, {"type": "text", "text": prompt}]}],
+        "messages": [{"role": "user", "content": content}],
     }
     request = urllib.request.Request(QWEN_ENDPOINT, data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     global QWEN_LAST_ERROR
@@ -241,19 +285,23 @@ def segmentation_prompt(hint: str = "") -> str:
     return f"""你是文档版面分析与语义分割专家。请分析这张草稿截图，给出适合后续裁剪、编辑和分页的语义区域。
 要求：
 1. 这是“裁剪区域”识别，不是给整页画几个大框。每个题号、段落、图表、结构式、公式都要成为独立且紧致的内容块，尽量贴合可见内容，排除周围空白；相邻内容只有在语义上不可分时才合并。
-2. 区域用覆盖内容的最小矩形表示；不要切断公式、化学结构式、图注或生物图片，不要让一个框横跨多个无关对象。
-3. 文字段落、题目、插图、表格、化学结构式、数学公式、生物图片分别识别；小块也必须保留，不得为了减少数量而丢弃。
-4. 同属一个题目/图片编号集合的区域使用相同 group（例如 1、1a、1b 都用 group=\"1\"）。
-5. 坐标为相对于原图的百分比 0-100，x/y 是左上角，w/h 是宽高；只输出 JSON，不要 Markdown。
-6. label 使用简短中文，kind 只能是 text/image/table/chemistry/biology/formula/other。
-7. 过滤页眉、页脚、装饰线和大面积空白；对每个真实内容给出边界，至少保留一个主内容区域。
-8. 原图被放在白色坐标框内，外侧只有蓝色坐标轴、刻度和 0..100 数值，没有内部网格线。内容框左上角对应 (0,0)，右下角对应 (100,100)。坐标轴、刻度和白色扩展区不是内容，必须忽略；输出坐标仍对应没有坐标框的原始图片。
+2. 区域边缘必须完整：保留文字笔画、标点、上下标、图注、箭头、键线、边框和图片边缘，不能因为框太紧而截断任何内容；也不要把大块空白放进区域。
+3. 化学反应式、反应机理、反应箭头、反应物/中间体/产物、条件标注和催化剂必须作为同一语义整体，不得按单行、单个化学式或单根箭头拆开。只有彼此独立的不同反应才分开。
+4. 文字段落、题目、插图、表格、化学结构式、数学公式、生物图片分别识别；小块也必须保留，不得为了减少数量而丢弃。
+5. 图片中用方框、圈选、叉划或删除线明确标出的内容，必须单独输出为一个区域，label 标注“待删除框选内容”，并设置 editAction=\"delete\"；框旁的手写修正、补充文字或替换内容必须另设独立区域，不能与被删除内容合并。
+6. 如果一个较大的语义块内部包含需要删除的方框区域，保留外部大块，同时在该区域输出 holes 数组描述需要挖白的内部框；不要把内部删除内容算作外部大块的一部分。
+7. 对三角形、楔形或不规则语义内容，可以用 polygon（0–100 百分比点列）或 triangle 形状表达，并且仍需给出覆盖它的 x/y/w/h；不要为了正方形而扩大到无关内容。没有 polygon 能力时，拆成多个紧邻的语义小块。
+8. 同属一个题目/图片编号集合的区域使用相同 group（例如 1、1a、1b 都用 group=\"1\"）；删除块和对应修正块也应保留可追踪的同组编号。
+9. 坐标为相对于原图的百分比 0-100，x/y 是左上角，w/h 是宽高；只输出 JSON，不要 Markdown。
+10. label 使用简短中文，kind 只能是 text/image/table/chemistry/biology/formula/other。
+11. 过滤页眉、页脚、装饰线和大面积空白；对每个真实内容给出边界，至少保留一个主内容区域。
+12. 原图被放在白色坐标框内，外侧只有蓝色坐标轴、刻度和 0..100 数值，没有内部网格线。内容框左上角对应 (0,0)，右下角对应 (100,100)。坐标轴、刻度和白色扩展区不是内容，必须忽略；输出坐标仍对应没有坐标框的原始图片。
 用户补充：{hint or '无'}
-输出格式：{{\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""
+输出格式：{{\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\",\"editAction\":\"keep|delete\",\"polygon\":[[x,y],[x,y],[x,y]],\"holes\":[{{\"x\":0,\"y\":0,\"w\":5,\"h\":5}}]}}]}}；polygon、holes、editAction 仅在确有需要时输出。"""
 
 
-def supervise_regions(model_image: str, proposal: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
-    """Have Qwen audit and correct the proposal, bounded to three rounds."""
+def supervise_regions(model_image: str, proposal: list[dict[str, Any]], original_image: str | None = None, candidate_sheet: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Have Qwen audit and correct the proposal, bounded to a safe number of rounds."""
 
     current = proposal
     audit: list[dict[str, Any]] = []
@@ -261,20 +309,23 @@ def supervise_regions(model_image: str, proposal: list[dict[str, Any]]) -> tuple
     # so a malformed model response cannot create an unbounded bill/loop.
     max_rounds = max(1, min(6, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "5"))))
     for round_number in range(1, max_rounds + 1):
-        review_prompt = f"""你是严格的版面分割监督审校 agent。请检查候选区域是否覆盖图片中所有真实内容，并指出漏块、误合并、边界过松/过紧、截断结构式或错误编号集合。
+        review_prompt = f"""你是严格的版面分割监督审校 agent。你会收到三张图：原始图片、带外侧坐标轴的分析图片、候选切割块接触表（接触表左上角文字是候选区域 id）。请同时查看三张图，逐一核对候选切割块是否来自正确位置，并检查候选区域是否覆盖图片中所有真实内容。
 监督标准：
-1. 每个可独立阅读或编辑的内容都必须有一个区域，小图注、化学键、公式、题号不能丢。
-2. 区域必须紧贴内容，不能把大块空白或无关内容放入同一个框。
-3. 不能切断相互连接的公式、化学结构式、表格、图片和图注。
-4. 坐标使用原图百分比 0-100，外侧坐标轴、刻度和白色扩展区不属于内容。
+1. 每个可独立阅读或编辑的内容都必须有一个区域，小图注、化学键、公式、题号、反应箭头不能丢。
+2. 逐像素检查区域边缘：不能截断笔画、上下标、键线、箭头、图注或图片边缘，也不能吞入大块空白。
+3. 化学反应式和机理必须完整保留反应物、条件、箭头、中间体、产物及相邻说明，不能被拆成互不完整的碎块。
+4. 方框、圈选、叉划或删除线标记的内容必须单独成为 editAction=\"delete\" 区域；旁边的修正必须另成区域；若外部大块包含删除框，外部区域必须用 holes 挖掉内部区域。
+5. 三角形/不规则内容可用 polygon 表示，且 bbox 必须覆盖完整内容；polygon 边缘同样不能截断语义内容。
+6. 坐标使用原图百分比 0-100，外侧坐标轴、刻度和白色扩展区不属于内容。
 如果不通过，直接给出修正后的完整 regions 数组，而不是只描述问题。只有确实满足标准时 status 才能是 pass。
 候选 regions：{json.dumps(current, ensure_ascii=False)}
-只输出 JSON：{{\"status\":\"pass\"或\"revise\",\"issues\":[\"...\"],\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""
-        parsed, error = qwen_request(model_image, review_prompt)
+只输出 JSON：{{\"status\":\"pass\"或\"revise\",\"issues\":[\"...\"],\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\",\"editAction\":\"keep|delete\",\"polygon\":[[x,y],[x,y],[x,y]],\"holes\":[{{\"x\":0,\"y\":0,\"w\":5,\"h\":5}}]}}]}}"""
+        review_images = [image for image in (original_image, model_image, candidate_sheet) if image] if original_image else model_image
+        parsed, error = qwen_request(review_images, review_prompt)
         if not parsed:
             audit.append({"round": round_number, "status": "error", "issues": [error or "监督请求失败"]})
             return current, audit, False
-        candidate = parsed.get("regions", []) if isinstance(parsed, dict) else []
+        candidate = parsed.get("regions", []) if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
         if isinstance(candidate, list) and candidate:
             current = normalize_regions(candidate)
         status = str(parsed.get("status", "revise")).lower() if isinstance(parsed, dict) else "revise"
@@ -297,7 +348,7 @@ def prepare_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, An
     if not parsed:
         print(f"Qwen request failed, using offline layout: {error}")
         return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [error or "初次分割失败"]}, model_image
-    proposal = parsed.get("regions", parsed if isinstance(parsed, list) else [])
+    proposal = parsed.get("regions", []) if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
     if not isinstance(proposal, list) or not proposal:
         return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no regions"]}, model_image
     return normalize_regions(proposal), "qwen-initial", {"status": "pending", "rounds": 0, "audit": []}, model_image
@@ -309,11 +360,11 @@ def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]]
     regions, source, supervision, model_image = prepare_qwen(image_data_url, hint)
     if source != "qwen-initial" or not model_image:
         return regions, source, supervision
-    regions, audit, passed = supervise_regions(model_image, regions)
+    regions, audit, passed = supervise_regions(model_image, regions, image_data_url, make_candidate_sheet(image_data_url, regions))
     return regions, "qwen-supervised", {"status": "pass" if passed else "max-rounds", "rounds": len(audit), "audit": audit}
 
 
-def start_supervision_job(model_image: str, proposal: list[dict[str, Any]]) -> str:
+def start_supervision_job(model_image: str, proposal: list[dict[str, Any]], original_image: str) -> str:
     """Continue supervision in the background so multiple jobs can run concurrently."""
 
     job_id = f"segment-{uuid.uuid4().hex}"
@@ -326,14 +377,14 @@ def start_supervision_job(model_image: str, proposal: list[dict[str, Any]]) -> s
             "regions": normalize_regions(proposal),
             "supervision": {"status": "pending", "rounds": 0, "audit": []},
         }
-    thread = threading.Thread(target=_run_supervision_job, args=(job_id, model_image, proposal), daemon=True)
+    thread = threading.Thread(target=_run_supervision_job, args=(job_id, model_image, proposal, original_image), daemon=True)
     thread.start()
     return job_id
 
 
-def _run_supervision_job(job_id: str, model_image: str, proposal: list[dict[str, Any]]) -> None:
+def _run_supervision_job(job_id: str, model_image: str, proposal: list[dict[str, Any]], original_image: str) -> None:
     try:
-        regions, audit, passed = supervise_regions(model_image, proposal)
+        regions, audit, passed = supervise_regions(model_image, proposal, original_image, make_candidate_sheet(original_image, proposal))
         status = "pass" if passed else "max-rounds"
         if audit and audit[-1].get("status") == "error":
             status = "error"
@@ -354,6 +405,48 @@ def get_supervision_job(job_id: str) -> dict[str, Any] | None:
     with QWEN_JOBS_LOCK:
         job = QWEN_JOBS.get(job_id)
         return dict(job) if job else None
+
+
+def normalize_points(raw: Any) -> list[list[float]]:
+    """Normalize optional polygon points expressed as [x,y] or {x,y}."""
+
+    points: list[list[float]] = []
+    if not isinstance(raw, list):
+        return points
+    for point in raw[:32]:
+        try:
+            if isinstance(point, dict):
+                px, py = point.get("x"), point.get("y")
+            elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                px, py = point[0], point[1]
+            else:
+                continue
+            points.append([round(max(0, min(100, float(px))), 2), round(max(0, min(100, float(py))), 2)])
+        except (TypeError, ValueError):
+            continue
+    return points if len(points) >= 3 else []
+
+
+def normalize_holes(raw: Any) -> list[dict[str, Any]]:
+    holes: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return holes
+    for hole in raw[:24]:
+        if isinstance(hole, dict) and all(key in hole for key in ("x", "y", "w", "h")):
+            try:
+                x = max(0, min(100, float(hole["x"])))
+                y = max(0, min(100, float(hole["y"])))
+                w = max(0, min(100 - x, float(hole["w"])))
+                h = max(0, min(100 - y, float(hole["h"])))
+                if w and h:
+                    holes.append({"x": round(x, 2), "y": round(y, 2), "w": round(w, 2), "h": round(h, 2)})
+            except (TypeError, ValueError):
+                continue
+        else:
+            polygon = normalize_points(hole)
+            if polygon:
+                holes.append({"polygon": polygon})
+    return holes
 
 
 def normalize_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -383,6 +476,15 @@ def normalize_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "group": str(region.get("group") or str(index + 1)),
                 "description": str(region.get("description") or "语义内容区域")[:120],
             }
+            action = str(region.get("editAction") or "keep").lower()
+            item["editAction"] = action if action in {"keep", "delete"} else "keep"
+            polygon = normalize_points(region.get("polygon") or region.get("triangle"))
+            if polygon:
+                item["polygon"] = polygon
+                item["shape"] = "triangle" if len(polygon) == 3 else "polygon"
+            holes = normalize_holes(region.get("holes"))
+            if holes:
+                item["holes"] = holes
             normalized.append(item)
         except (TypeError, ValueError):
             continue
@@ -456,7 +558,7 @@ class Handler(BaseHTTPRequestHandler):
                 regions, source, supervision, model_image = prepare_qwen(image, str(payload.get("hint", "")))
                 response: dict[str, Any] = {"regions": regions, "source": source, "model": QWEN_MODEL, "supervision": supervision}
                 if source == "qwen-initial" and model_image:
-                    job_id = start_supervision_job(model_image, regions)
+                    job_id = start_supervision_job(model_image, regions, image)
                     response["jobId"] = job_id
                     response["supervision"] = {**supervision, "jobId": job_id}
                 json_response(self, response)

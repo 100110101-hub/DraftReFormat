@@ -106,12 +106,11 @@ function renderRegions() {
   const layer = $("#regionLayer");
   const items = visualRegions();
   layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${items.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX || 28}px;top:${region.layoutY || 28}px;width:${region.layoutW || 1}px;height:${region.layoutH || 1}px;border-color:${kindColors[region.kind] || kindColors.other};z-index:${region.zIndex || 2}">
-    <img src="${region.cropSrc || image.src}" alt="${escapeHtml(region.label)}" draggable="false"/><div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span><button class="tile-delete" data-delete-region="${region.id}" title="删除内容块">×</button></div>`).join("")}`;
+    <img src="${region.cropSrc || image.src}" alt="${escapeHtml(region.label)}" draggable="false"/><div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span></div>`).join("")}`;
   $$(".region-tile").forEach((box) => {
     box.addEventListener("pointerdown", (event) => startRegionPointer(event, box));
     box.addEventListener("click", (event) => { event.stopPropagation(); state.currentId = box.dataset.imageId; state.selectedRegionId = box.dataset.regionId; renderRegions(); renderInspector(); });
   });
-  $$("[data-delete-region]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); deleteRegion(button.closest(".region-tile").dataset.imageId, button.dataset.deleteRegion); }));
   updateOutputCanvasSize(items);
   if (!state.hydrating && items.some(({ region, image }) => !region.cropSrc && (!region.synthetic || !image.previewReady))) hydrateVisualRegions();
 }
@@ -236,7 +235,6 @@ function bindEvents() {
   ["X", "Y", "W", "H"].forEach((key) => $("#region" + key).addEventListener("change", (event) => updateSelected(key.toLowerCase(), Number(event.target.value))));
   $("#layerBottom").addEventListener("click", () => changeLayer("bottom")); $("#layerDown").addEventListener("click", () => changeLayer("down")); $("#layerUp").addEventListener("click", () => changeLayer("up")); $("#layerTop").addEventListener("click", () => changeLayer("top"));
   $("#keepGroupsToggle").addEventListener("click", () => { state.keepGroups = !state.keepGroups; $("#keepGroupsToggle").classList.toggle("on", state.keepGroups); });
-  $("#marginRange").addEventListener("input", (event) => { $("#marginValue").textContent = `${event.target.value} px`; });
   $$(".tool-button").forEach((button) => button.addEventListener("click", () => setTool(button.dataset.tool)));
   const frame = $("#canvasFrame");
   frame.addEventListener("pointerdown", startCanvasPointer);
@@ -347,12 +345,14 @@ async function waitForSupervision(jobId, initialResult) {
 async function segmentCurrent() {
   const image = currentImage(); if (!image) return showToast("请先选择一张图片", "warn");
   const button = $("#segmentButton"); button.disabled = true; button.innerHTML = '<span class="spinner"></span>正在理解语义…';
+  setProcessingStatus("正在提交当前图片到 Qwen…");
   try {
     let result;
     if (image.src.startsWith("data:image/")) { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); }
     else { result = { regions: structuredClone(demoRegions), source: "offline" }; }
-    if (result.jobId) { button.innerHTML = '<span class="spinner"></span>监督审校中…'; result = await waitForSupervision(result.jobId, result); }
+    if (result.jobId) { button.innerHTML = '<span class="spinner"></span>监督审校中…'; setProcessingStatus("初次分割完成，正在监督审校…"); result = await waitForSupervision(result.jobId, result); }
     applyAnalysisResult(image, result);
+    setProcessingStatus("当前图片已完成最终分区");
     showToast(result.source === "qwen-supervised" ? `Qwen 分割 + 监督审校完成（${result.supervision?.rounds || 1} 轮）` : "已使用离线演示分区（可继续手动调整）", result.source === "qwen-supervised" ? "success" : "warn");
   } catch (error) { showToast(error.message || "分析失败，请稍后重试", "error"); }
   finally { button.disabled = false; button.innerHTML = "<span>✦</span>分析当前图片"; }
@@ -362,21 +362,27 @@ async function segmentAll() {
   const candidates = state.images.filter((image) => image.src.startsWith("data:image/") && !image.analyzed);
   if (!candidates.length) return showToast("队列中的图片都已分析，可继续人工调整", "warn");
   const batchButton = $("#segmentAllButton"); batchButton.disabled = true; batchButton.innerHTML = '<span class="spinner"></span>并发分析与审校中…';
+  let finished = 0;
+  setProcessingStatus("正在并发提交 " + candidates.length + " 张素材…");
   try {
     const results = await Promise.all(candidates.map(async (image) => {
       try {
         const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) });
         let result = await response.json();
         if (!response.ok) throw new Error(result.error || "分析失败");
-        if (result.jobId) result = await waitForSupervision(result.jobId, result);
+        if (result.jobId) { setProcessingStatus("已提交 " + candidates.length + " 张，等待监督审校（完成 " + finished + "/" + candidates.length + "）…"); result = await waitForSupervision(result.jobId, result); }
         applyAnalysisResult(image, result);
+        finished += 1;
+        setProcessingStatus("并发处理进度：完成 " + finished + "/" + candidates.length + " 张");
         return { ok: true };
       } catch {
         applyAnalysisResult(image, { regions: structuredClone(demoRegions), source: "offline", supervision: { status: "error", rounds: 0, audit: [] } });
+        finished += 1;
+        setProcessingStatus("并发处理进度：完成 " + finished + "/" + candidates.length + " 张");
         return { ok: false };
       }
     }));
-    render(); showToast(`已并发完成 ${results.length} 张图片的语义分区`, "success");
+    render(); setProcessingStatus("已完成 " + results.length + " 张图片的最终分区"); showToast(`已并发完成 ${results.length} 张图片的语义分区`, "success");
   } finally { batchButton.disabled = false; batchButton.textContent = "批量分析素材队列"; }
 }
 
@@ -405,31 +411,60 @@ function saveProject() { const images = state.images.map((image) => ({ ...image,
 
 async function exportFinal() {
   if (!state.images.length) return showToast("请先加入图片素材", "warn");
-  const button = $("#exportButton"); button.disabled = true; showToast("正在整理分页，编号集合不会被拆开…", "success");
-  try { const html = await buildExportHtml(); const output = window.open("", "_blank"); if (!output) throw new Error("浏览器拦截了预览窗口，请允许弹窗"); output.document.write(html); output.document.close(); } catch (error) { showToast(error.message || "导出失败", "error"); } finally { button.disabled = false; }
+  const button = $("#exportButton"); button.disabled = true; setProcessingStatus("正在生成终稿…"); showToast("正在整理分页，编号集合不会被拆开…", "success");
+  try { const html = await buildExportHtml(); const output = window.open("", "_blank"); if (!output) throw new Error("浏览器拦截了预览窗口，请允许弹窗"); output.document.write(html); output.document.close(); } catch (error) { setProcessingStatus("导出失败"); showToast(error.message || "导出失败", "error"); } finally { button.disabled = false; }
 }
 
 async function buildExportHtml() {
   const blocks = [];
+  const totalImages = state.images.length;
+  let imageIndex = 0;
   for (const image of state.images) {
+    imageIndex += 1;
+    setProcessingStatus("正在裁剪第 " + imageIndex + "/" + totalImages + " 张素材…");
     const groups = new Map();
-    (image.regions.length ? image.regions : [{ id: "full", label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, group: "未分组", confidence: 1 }]).forEach((region) => { const key = state.keepGroups ? (region.group || region.id) : region.id; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(region); });
-    for (const [group, regions] of groups) { const crops = []; for (const region of regions) crops.push({ region, src: region.cropSrc || await cropRegion(image, region) }); blocks.push({ group, image, regions: crops, y: Math.min(...regions.map((region) => region.layoutY || 0)), height: regions.reduce((sum, region) => sum + (region.layoutH || region.h * 8), 0) + 28 }); }
+    const keptRegions = image.regions.filter((region) => region.editAction !== "delete");
+    const regions = keptRegions.length ? keptRegions : (image.regions.length ? [] : [{ id: "full", label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, group: "未分组", confidence: 1 }]);
+    regions.forEach((region) => { const key = state.keepGroups ? (region.group || region.id) : region.id; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(region); });
+    for (const [group, groupRegions] of groups) {
+      const crops = [];
+      for (const region of groupRegions) crops.push({ region, src: region.cropSrc || await cropRegion(image, region) });
+      blocks.push({ group, image, regions: crops, y: Math.min(...groupRegions.map((region) => region.layoutY || 0)), height: groupRegions.reduce((sum, region) => sum + (region.layoutH || region.h * 8), 0) });
+    }
   }
+  setProcessingStatus("正在按集合分页（每个集合保持完整）…");
   blocks.sort((a, b) => a.y - b.y);
-  const pages = []; let page = []; let used = 0; const limit = $("#pageSize").value === "a3" ? 1240 : 840;
-  blocks.forEach((block) => { const blockHeight = Math.max(90, Math.min(1250, block.height)); if (page.length && used + blockHeight > limit) { pages.push(page); page = []; used = 0; } page.push(block); used += blockHeight; }); if (page.length) pages.push(page);
-  const size = $("#pageSize").value; const margin = $("#marginRange").value;
-  const pagesHtml = pages.map((items, index) => `<section class="print-page"><div class="page-header"><div><span class="print-kicker">DRAFT REFORMAT · FINAL</span><h1>${escapeHtml(state.projectName)}</h1></div><span class="page-no">${String(index + 1).padStart(2, "0")} / ${String(pages.length).padStart(2, "0")}</span></div>${items.map((block) => `<div class="print-group"><div class="group-title"><span>集合 ${escapeHtml(block.group)}</span><i></i><small>${escapeHtml(block.image.name)}</small></div>${block.regions.map((item) => `<article class="print-block" style="margin-left:${Math.min(110, Math.max(0, item.region.layoutX || 0))}px"><img src="${item.src}" alt="${escapeHtml(item.region.label)}"/><div class="print-caption"><b>${escapeHtml(item.region.label)}</b><span>${kindNames[item.region.kind] || "内容区域"}</span></div></article>`).join("")}</div>`).join("")}<div class="page-footer"><span>语义裁剪 · 人工校订 · 集合不拆页</span><span>${new Date().toLocaleDateString("zh-CN")}</span></div></section>`).join("");
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(state.projectName)} · 终稿</title><style>@page{size:${size} portrait;margin:0}*{box-sizing:border-box}body{margin:0;background:#e7e8eb;color:#20232b;font-family:Inter,Arial,"Microsoft YaHei",sans-serif}.print-page{width:${size === "a3" ? "1123px" : "794px"};min-height:${size === "a3" ? "1587px" : "1123px"};padding:${margin}px;page-break-after:always;background:#fff;margin:24px auto;display:flex;flex-direction:column}.page-header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #d9dce2;padding-bottom:15px;margin-bottom:20px}.print-kicker{font-size:8px;letter-spacing:.2em;color:#765fce;font-weight:bold}.page-header h1{margin:7px 0 0;font-size:22px;letter-spacing:-.02em}.page-no{font-size:10px;color:#8a919d;border:1px solid #dfe2e8;padding:5px 7px;border-radius:4px}.print-group{border:1px solid #e2e4e8;border-radius:7px;padding:12px;margin-bottom:14px;break-inside:avoid}.group-title{font-size:10px;color:#6e5bb7;display:flex;align-items:center;gap:8px;margin-bottom:10px}.group-title i{height:1px;background:#ebeaf1;flex:1}.group-title small{font-size:8px;color:#9aa0aa;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.print-block{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end;margin-top:8px;break-inside:avoid}.print-block img{max-width:100%;width:100%;max-height:490px;object-fit:contain;object-position:left top;border:1px solid #eff0f2;border-radius:3px;background:#fcfcfc}.print-caption{font-size:9px;color:#606873;white-space:nowrap;writing-mode:vertical-rl;max-height:130px}.print-caption b{color:#303641;font-size:10px;margin-bottom:5px}.page-footer{margin-top:auto;padding-top:16px;border-top:1px solid #e6e7e9;display:flex;justify-content:space-between;color:#a0a6af;font-size:8px}@media print{body{background:#fff}.print-page{margin:0;box-shadow:none}}@media screen{.print-page{box-shadow:0 10px 35px rgba(30,33,40,.13)}}.print-help{position:fixed;right:20px;top:20px;background:#27243d;color:#eee;padding:10px 13px;border-radius:6px;font-size:11px}@media print{.print-help{display:none}}</style></head><body><div class="print-help">已生成 ${pages.length} 页 · 使用 Ctrl/Cmd + P 保存为 PDF</div>${pagesHtml}<script>setTimeout(()=>window.print(),600)<\/script></body></html>`;
+  const size = $("#pageSize").value;
+  const dimensions = { a4: [794, 1123], a3: [1123, 1587], letter: [816, 1056] };
+  const [pageWidth, pageHeight] = dimensions[size] || dimensions.a4;
+  const pages = [];
+  let page = [];
+  let used = 0;
+  blocks.forEach((block) => {
+    const blockHeight = Math.max(1, Math.min(pageHeight, block.height));
+    if (page.length && used + blockHeight > pageHeight) { pages.push(page); page = []; used = 0; }
+    page.push(block);
+    used += blockHeight;
+  });
+  if (page.length) pages.push(page);
+  const pagesHtml = pages.map((items) => items.map((block) => {
+    const blocksHtml = block.regions.map((item) => { const width = item.region.layoutW ? ' style="width:' + item.region.layoutW + 'px;max-width:100%;height:auto"' : ''; return '<article class="print-block"><img' + width + ' src="' + item.src + '" alt="" /></article>'; }).join('');
+    return '<section class="print-group" aria-label="集合 ' + escapeHtml(block.group) + '">' + blocksHtml + '</section>';
+  }).join('')).map((groupsHtml) => '<section class="print-page">' + groupsHtml + '</section>').join('');
+  setProcessingStatus("正在打开纯内容 PDF 预览（" + pages.length + " 页）…");
+  const css = '@page{size:' + size + ' portrait;margin:0}' +
+    '*{box-sizing:border-box}' +
+    'html,body{margin:0;padding:0;background:#fff}' +
+    '.print-page{width:' + pageWidth + 'px;height:' + pageHeight + 'px;min-height:' + pageHeight + 'px;margin:0;padding:0;overflow:hidden;background:#fff;page-break-after:always;break-after:page}' +
+    '.print-group{margin:0;padding:0;break-inside:avoid;page-break-inside:avoid}' +
+    '.print-block{display:block;margin:0;padding:0;break-inside:avoid;page-break-inside:avoid;line-height:0}' +
+    '.print-block img{display:block;width:auto;height:auto;max-width:100%;max-height:none;object-fit:contain;object-position:left top;border:0;border-radius:0;background:#fff}' +
+    '@media screen{.print-page{outline:1px solid #dfe2e8}}';
+  return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>' + escapeHtml(state.projectName) + ' · 终稿</title><style>' + css + '</style></head><body>' + pagesHtml + '<script>setTimeout(()=>window.print(),600)</script></body></html>';
 }
 
-function cropRegion(image, region) { return new Promise((resolve) => { const img = new Image(); img.onload = () => { try { const sx = img.naturalWidth * region.x / 100; const sy = img.naturalHeight * region.y / 100; const sw = img.naturalWidth * region.w / 100; const sh = img.naturalHeight * region.h / 100; const canvas = document.createElement("canvas"); const scale = Math.min(1, 1200 / Math.max(sw, sh)); canvas.width = Math.max(1, Math.round(sw * scale)); canvas.height = Math.max(1, Math.round(sh * scale)); const ctx = canvas.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height); drawCropWhiteouts(ctx, image, region, canvas.width, canvas.height); resolve(canvas.toDataURL("image/jpeg", .92)); } catch { resolve(image.src); } }; img.onerror = () => resolve(image.src); img.src = image.src; }); }
-function drawCropWhiteouts(ctx, image, region, width, height) {
-  (state.whiteRects[image.id] || []).forEach((item) => { const x = (item.x - region.x) / region.w * width; const y = (item.y - region.y) / region.h * height; const w = item.w / region.w * width; const h = item.h / region.h * height; ctx.fillStyle = "#fff"; ctx.fillRect(x, y, w, h); });
-  (state.paintPaths[image.id] || []).forEach((path) => { if (path.points.length < 1) return; ctx.strokeStyle = "#fff"; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.lineWidth = path.size / region.w * width; ctx.beginPath(); path.points.forEach((point, index) => { const x = (point.x - region.x) / region.w * width; const y = (point.y - region.y) / region.h * height; index ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke(); });
-}
 function escapeHtml(value) { return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character])); }
+function setProcessingStatus(message) { const node = $("#processingStatus"); if (node) node.textContent = message; }
 function showToast(message, type = "success") { const toast = document.createElement("div"); toast.className = `toast ${type}`; toast.textContent = message; $("#toastStack").appendChild(toast); setTimeout(() => toast.remove(), 3400); }
 
 init();

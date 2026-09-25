@@ -1,0 +1,6 @@
+.web-upload-button { display: inline-flex; color: #767f90; font-size: 9px; margin-top: 9px; cursor: pointer; border-bottom: 1px dashed #3a4150; padding-bottom: 2px; }
+.web-upload-button:hover { color: #b5a7f4; border-color: #7666c5; }
+.spinner { width: 10px; height: 10px; border: 1px solid #9c8eff; border-top-color: transparent; display: inline-block; border-radius: 50%; animation: spin .7s linear infinite; }
+.ai-batch-button { width: 100%; margin-top: 7px; padding: 6px; border-radius: 5px; color: #8e86ad; background: transparent; border: 1px solid #343047; font-size: 9px; }
+.ai-batch-button:hover { border-color: #6557a0; color: #c4b7ff; }
+@keyframes spin { to { transform: rotate(360deg); } }

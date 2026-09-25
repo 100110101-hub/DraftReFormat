@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0e14" />
+    <title>Draft ReFormat · 语义终稿工作台</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/web-extra.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <div class="brand-mark"><span></span><span></span><span></span></div>
+          <div>
+            <div class="brand-name">DRAFT <b>REFORMAT</b></div>
+            <div class="brand-sub">SEMANTIC LAYOUT STUDIO</div>
+          </div>
+        </div>
+        <div class="topbar-center">
+          <div class="project-pill"><span class="status-dot"></span><span id="projectName">未命名草稿</span><button id="renameProject" class="icon-button" title="重命名">⌘</button></div>
+          <span class="save-state"><span class="save-dot"></span><span id="saveState">自动保存已开启</span></span>
+        </div>
+        <div class="topbar-actions">
+          <button class="ghost-button" id="undoButton" title="撤销"><span>↶</span><em>撤销</em></button>
+          <button class="ghost-button" id="redoButton" title="重做"><span>↷</span><em>重做</em></button>
+          <div class="divider"></div>
+          <button class="outline-button" id="saveProjectButton"><span>⇩</span>保存项目</button>
+          <button class="primary-button" id="exportButton"><span>✦</span>导出终稿</button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="sidebar left-sidebar">
+          <div class="sidebar-scroll">
+            <section class="side-section import-section">
+              <div class="section-heading"><span>输入素材</span><span class="counter" id="imageCount">0</span></div>
+              <label class="upload-zone" for="fileInput">
+                <div class="upload-icon">＋</div>
+                <strong>拖入图片，或点击上传</strong>
+                <span>PNG / JPG / WEBP · 支持多选</span>
+                <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden />
+              </label>
+              <div class="url-import">
+                <div class="input-label"><span class="tiny-globe">◎</span> 从网页导入</div>
+                <div class="inline-input"><input id="urlInput" type="url" placeholder="粘贴网页地址" /><button id="importUrlButton">导入</button></div>
+                <p id="urlStatus" class="muted-note">会读取页面中的图片资源，不会修改原网页</p>
+                <label class="web-upload-button" for="htmlInput">或上传 HTML / MHTML 文件<input id="htmlInput" type="file" accept=".html,.htm,.mhtml,text/html" hidden /></label>
+              </div>
+            </section>
+
+            <section class="side-section">
+              <div class="section-heading"><span>素材队列</span><button id="sortImages" class="text-button">按编号排序</button></div>
+              <div class="asset-list" id="assetList"></div>
+            </section>
+
+            <section class="side-section ai-section">
+              <div class="section-heading"><span>语义分区</span><span class="ai-chip">QWEN VISION</span></div>
+              <div class="ai-card">
+                <div class="ai-card-top"><div class="qwen-orb">✦</div><div><strong>自动识别内容块</strong><span id="modelName">qwen-vl-max</span></div><div class="toggle on" id="autoSaveToggle"><i></i></div></div>
+                <p>理解题目、图表、化学结构式、生物图片与编号关系，生成可编辑的语义边界。</p>
+                <button class="ai-run-button" id="segmentButton"><span>✦</span>分析当前图片</button>
+                <button class="ai-batch-button" id="segmentAllButton">批量分析素材队列</button>
+              </div>
+              <div class="legend-row"><span><i class="legend-swatch text"></i>文字</span><span><i class="legend-swatch image"></i>图片</span><span><i class="legend-swatch formula"></i>公式</span><span><i class="legend-swatch group"></i>编号集合</span></div>
+            </section>
+          </div>
+          <div class="sidebar-footer"><div class="privacy-mark">⌁</div><div><strong>本地优先</strong><span>图片只在分析时发送到 Qwen</span></div><button class="icon-button">?</button></div>
+        </aside>
+
+        <main class="main-stage">
+          <div class="stage-toolbar">
+            <div class="breadcrumb"><span>草稿</span><b>/</b><strong id="currentImageName">未选择图片</strong></div>
+            <div class="stage-tools">
+              <div class="tool-group">
+                <button class="tool-button active" data-tool="select" title="选择/拖动"><span>↖</span><em>选择</em></button>
+                <button class="tool-button" data-tool="draw" title="手动新增分区"><span>⌁</span><em>分区</em></button>
+                <button class="tool-button" data-tool="brush" title="画笔涂白"><span>✎</span><em>涂白</em></button>
+                <button class="tool-button" data-tool="cover" title="方形覆盖"><span>□</span><em>覆盖</em></button>
+              </div>
+              <div class="divider"></div>
+              <button class="icon-button zoom-button" id="zoomOut">−</button><span class="zoom-label" id="zoomLabel">100%</span><button class="icon-button zoom-button" id="zoomIn">＋</button>
+              <button class="icon-button" id="fitButton" title="适应窗口">⌗</button>
+            </div>
+          </div>
+          <div class="canvas-area" id="canvasArea">
+            <div class="empty-state" id="emptyState">
+              <div class="empty-icon">✦</div>
+              <h2>把草稿放到这里</h2>
+              <p>上传多张截图后，Qwen 会按语义理解内容并给出可编辑的分区建议。</p>
+              <label for="fileInput" class="primary-button">选择图片</label>
+            </div>
+            <div class="canvas-wrap" id="canvasWrap" hidden>
+              <div class="canvas-frame" id="canvasFrame">
+                <img id="pageImage" alt="当前草稿" draggable="false" />
+                <canvas id="paintLayer"></canvas>
+                <div id="regionLayer"></div>
+                <div class="canvas-hint" id="canvasHint"><span>✦</span><span>选择区域后可拖动调整边界</span></div>
+              </div>
+            </div>
+            <div class="stage-help"><span class="key-hint">空格</span> 平移画布 <span class="key-hint">⌘ Z</span> 撤销 <span class="help-separator"></span> 当前工具：<strong id="toolHint">选择</strong></div>
+          </div>
+          <div class="bottom-strip"><div class="strip-stat"><span class="strip-icon">▦</span><span id="regionCount">0 个内容块</span></div><div class="strip-stat"><span class="strip-icon violet">⌁</span><span id="groupCount">0 个编号集合</span></div><div class="strip-stat"><span class="strip-icon amber">◷</span><span>最后分析 <b id="lastAnalyzed">尚未分析</b></span></div><div class="strip-spacer"></div><button class="text-button" id="clearWhiteouts">清除当前涂白</button><button class="text-button danger" id="deleteRegion">删除选中</button></div>
+        </main>
+
+        <aside class="sidebar right-sidebar">
+          <div class="inspector-header"><div><span class="eyebrow">INSPECTOR</span><h2>属性检查器</h2></div><button class="icon-button">•••</button></div>
+          <div class="inspector-scroll" id="inspector">
+            <div class="no-selection" id="noSelection"><div class="no-selection-icon">⌁</div><strong>选择一个内容块</strong><span>拖动边界、修改标签或调整<br />编号集合归属</span></div>
+            <div id="regionInspector" hidden>
+              <div class="selected-preview" id="selectedPreview"><span class="preview-type" id="previewType">TEXT</span><span class="preview-group" id="previewGroup">集合 01</span></div>
+              <div class="property-block"><label>语义标签</label><input id="regionLabel" type="text" /><div class="suggestion-row"><button data-label="正文说明">正文说明</button><button data-label="图表 / 图片">图表 / 图片</button><button data-label="化学结构式">化学结构式</button></div></div>
+              <div class="property-block"><label>内容类型</label><div class="select-like" id="kindSelect"><span id="regionKind">文字段落</span><span>⌄</span></div><div class="kind-menu" id="kindMenu"><button data-kind="text">文字段落</button><button data-kind="image">图片 / 插图</button><button data-kind="table">表格</button><button data-kind="chemistry">化学结构式</button><button data-kind="biology">生物图片</button><button data-kind="formula">数学公式</button></div></div>
+              <div class="property-block"><div class="label-with-value"><label>编号集合</label><span class="group-badge" id="groupBadge">A</span></div><div class="group-input-row"><input id="regionGroup" type="text" /><button id="newGroupButton">新建</button></div><p class="field-note">同一集合内的内容会在导出分页时保持完整。</p></div>
+              <div class="property-block coordinates"><div class="label-with-value"><label>边界位置</label><span class="field-note">百分比</span></div><div class="coord-grid"><label>X<input id="regionX" type="number" min="0" max="100" step="0.1" /></label><label>Y<input id="regionY" type="number" min="0" max="100" step="0.1" /></label><label>W<input id="regionW" type="number" min="1" max="100" step="0.1" /></label><label>H<input id="regionH" type="number" min="1" max="100" step="0.1" /></label></div></div>
+              <div class="confidence-block"><div class="confidence-heading"><span>AI 置信度</span><b id="confidenceValue">82%</b></div><div class="confidence-bar"><i id="confidenceBar"></i></div><span class="field-note" id="regionDescription">模型对该语义块的识别较为稳定</span></div>
+              <button class="danger-outline" id="removeInspectorRegion">移除该内容块</button>
+            </div>
+            <div class="divider-line"></div>
+            <section class="output-section"><div class="output-heading"><div><span class="eyebrow">OUTPUT</span><h3>终稿设置</h3></div><span class="ready-pill">READY</span></div><div class="output-row"><span>分页尺寸</span><select id="pageSize"><option value="a4">A4 · 竖版</option><option value="a3">A3 · 竖版</option><option value="letter">Letter · 竖版</option></select></div><div class="output-row"><span>集合不拆页</span><div class="toggle on" id="keepGroupsToggle"><i></i></div></div><div class="output-row"><span>页边距</span><div class="range-wrap"><input id="marginRange" type="range" min="24" max="96" value="48" /><span id="marginValue">48 px</span></div></div><div class="page-flow"><span class="flow-node active">素材</span><i>→</i><span class="flow-node active">分区</span><i>→</i><span class="flow-node">分页</span><i>→</i><span class="flow-node">终稿</span></div><button class="full-export-button" id="inspectorExport"><span>✦</span>生成分页预览</button></section>
+          </div>
+        </aside>
+      </div>
+    </div>
+    <div class="toast-stack" id="toastStack"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

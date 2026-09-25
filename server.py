@@ -33,6 +33,7 @@ QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-3.6-plus")
 QWEN_ENDPOINT = os.environ.get(
     "QWEN_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 )
+QWEN_LAST_ERROR = ""
 
 
 def load_dotenv() -> None:
@@ -194,15 +195,18 @@ def qwen_request(model_image: str, prompt: str, model: str | None = None) -> tup
         "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": model_image}}, {"type": "text", "text": prompt}]}],
     }
     request = urllib.request.Request(QWEN_ENDPOINT, data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
+    global QWEN_LAST_ERROR
     try:
         with urllib.request.urlopen(request, timeout=90) as response:
             body = json.loads(response.read().decode("utf-8"))
         content = body["choices"][0]["message"]["content"]
         if isinstance(content, list):
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        QWEN_LAST_ERROR = ""
         return json.loads(clean_json_text(str(content))), None
     except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        return None, str(exc)
+        QWEN_LAST_ERROR = str(exc)
+        return None, QWEN_LAST_ERROR
 
 
 def segmentation_prompt(hint: str = "") -> str:
@@ -334,7 +338,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/api/health":
-            json_response(self, {"ok": True, "model": QWEN_MODEL, "configured": bool(os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY"))})
+            json_response(self, {"ok": True, "model": QWEN_MODEL, "configured": bool(os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")), "lastQwenError": QWEN_LAST_ERROR or None})
             return
         path = self.path.split("?", 1)[0]
         if path == "/":

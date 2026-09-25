@@ -27,6 +27,9 @@ const state = {
   redo: [],
   paintPaths: {},
   whiteRects: {},
+  layoutWhiteRects: [],
+  layoutPaintPaths: [],
+  hydrating: false,
   lastAnalyzed: null,
   keepGroups: true,
 };
@@ -62,8 +65,8 @@ function init() {
 
 function currentImage() { return state.images.find((image) => image.id === state.currentId) || null; }
 function selectedRegion() { const image = currentImage(); return image?.regions.find((region) => region.id === state.selectedRegionId) || null; }
-function snapshot() { return JSON.stringify({ images: state.images, currentId: state.currentId, selectedRegionId: state.selectedRegionId, paintPaths: state.paintPaths, whiteRects: state.whiteRects }); }
-function restoreSnapshot(value) { const parsed = JSON.parse(value); state.images = parsed.images; state.currentId = parsed.currentId; state.selectedRegionId = parsed.selectedRegionId; state.paintPaths = parsed.paintPaths || {}; state.whiteRects = parsed.whiteRects || {}; render(); }
+function snapshot() { return JSON.stringify({ images: state.images, currentId: state.currentId, selectedRegionId: state.selectedRegionId, paintPaths: state.paintPaths, whiteRects: state.whiteRects, layoutWhiteRects: state.layoutWhiteRects, layoutPaintPaths: state.layoutPaintPaths }); }
+function restoreSnapshot(value) { const parsed = JSON.parse(value); state.images = parsed.images; state.currentId = parsed.currentId; state.selectedRegionId = parsed.selectedRegionId; state.paintPaths = parsed.paintPaths || {}; state.whiteRects = parsed.whiteRects || {}; state.layoutWhiteRects = parsed.layoutWhiteRects || []; state.layoutPaintPaths = parsed.layoutPaintPaths || []; render(); }
 function pushHistory() { state.history.push(snapshot()); if (state.history.length > 35) state.history.shift(); state.redo = []; }
 function undo() { if (!state.history.length) return showToast("没有可撤销的操作", "warn"); state.redo.push(snapshot()); restoreSnapshot(state.history.pop()); }
 function redo() { if (!state.redo.length) return showToast("没有可重做的操作", "warn"); state.history.push(snapshot()); restoreSnapshot(state.redo.pop()); }
@@ -77,8 +80,6 @@ function render() {
   $("#canvasWrap").hidden = !image;
   if (!image) { $("#currentImageName").textContent = "未选择图片"; $("#regionCount").textContent = "0 个内容块"; $("#groupCount").textContent = "0 个编号集合"; renderInspector(); return; }
   $("#currentImageName").textContent = image.name;
-  const img = $("#pageImage");
-  if (img.src !== image.src) { img.src = image.src; img.onload = () => { resizePaintCanvas(); drawPaint(); }; }
   renderRegions();
   renderInspector();
   renderStats();
@@ -96,19 +97,81 @@ function renderAssets() {
 }
 
 function renderRegions() {
-  const image = currentImage();
   const layer = $("#regionLayer");
-  layer.innerHTML = (image?.regions || []).map((region, index) => `<div class="region-box ${region.id === state.selectedRegionId ? "selected" : ""}" data-region-id="${region.id}" data-kind="${region.kind}" style="left:${region.x}%;top:${region.y}%;width:${region.w}%;height:${region.h}%;border-color:${kindColors[region.kind] || kindColors.other}">
-    <span class="region-label">${escapeHtml(region.label)}</span><span class="region-index">${escapeHtml(region.group || "—")}</span><span class="resize-handle"></span></div>`).join("");
-  $$(".region-box").forEach((box) => {
+  const items = visualRegions();
+  layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${items.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX || 28}px;top:${region.layoutY || 28}px;width:${region.layoutW || 240}px;height:${region.layoutH || 120}px;border-color:${kindColors[region.kind] || kindColors.other}">
+    <img src="${region.cropSrc || image.src}" alt="${escapeHtml(region.label)}" draggable="false"/><div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span></div>`).join("")}`;
+  $$(".region-tile").forEach((box) => {
     box.addEventListener("pointerdown", (event) => startRegionPointer(event, box));
-    box.addEventListener("click", (event) => { event.stopPropagation(); state.selectedRegionId = box.dataset.regionId; renderRegions(); renderInspector(); });
+    box.addEventListener("click", (event) => { event.stopPropagation(); state.currentId = box.dataset.imageId; state.selectedRegionId = box.dataset.regionId; renderRegions(); renderInspector(); });
+  });
+  updateOutputCanvasSize(items);
+  if (!state.hydrating && items.some(({ region, image }) => !region.cropSrc && (!region.synthetic || !image.previewReady))) hydrateVisualRegions();
+}
+
+function visualRegions() {
+  const result = [];
+  state.images.forEach((image) => {
+    if (!image.regions.length && !image.syntheticRegion) image.syntheticRegion = { id: `whole-${image.id}`, label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, confidence: 1, group: "—", description: "尚未分析的整张图片", synthetic: true, layoutW: 740, layoutH: 300, layoutX: 28, layoutY: 28 };
+    const regions = image.regions.length ? image.regions : [image.syntheticRegion];
+    regions.forEach((region) => result.push({ image, region }));
+  });
+  return result;
+}
+
+function updateOutputCanvasSize(items) {
+  const canvas = $("#outputCanvas"); if (!canvas) return;
+  const bottom = items.reduce((max, item) => Math.max(max, (item.region.layoutY || 28) + (item.region.layoutH || 120)), 0);
+  canvas.style.height = `${Math.max(1120, bottom + 44)}px`;
+  canvas.style.minHeight = `${Math.max(1120, bottom + 44)}px`;
+}
+
+async function hydrateVisualRegions() {
+  state.hydrating = true;
+  try {
+    const items = visualRegions();
+    for (const { image, region } of items) {
+      if (!image.aspect) image.aspect = await imageAspect(image.src);
+      if (!region.layoutW || !region.layoutH) initializeRegionLayout(region, image);
+      if (!region.cropSrc && !region.synthetic) region.cropSrc = await cropRegion(image, region);
+      if (region.synthetic && !region.cropSrc) { region.cropSrc = image.src; image.previewReady = true; }
+    }
+    normalizeLongLayout();
+  } finally {
+    state.hydrating = false;
+    renderRegions();
+    resizePaintCanvas(); drawPaint();
+  }
+}
+
+function imageAspect(src) { return new Promise((resolve) => { const img = new Image(); img.onload = () => resolve(img.naturalWidth && img.naturalHeight ? img.naturalWidth / img.naturalHeight : .72); img.onerror = () => resolve(.72); img.src = src; }); }
+
+function initializeRegionLayout(region, image) {
+  const width = Math.max(150, Math.min(760, 760 * region.w / 100));
+  region.layoutW = Math.round(width);
+  region.layoutH = Math.round(Math.max(54, width * region.h / 100 / (image.aspect || .72)));
+  region.layoutX = 28;
+  const all = visualRegions().filter(({ region: item }) => item !== region && item.layoutY != null);
+  const last = all.reduce((max, item) => Math.max(max, item.region.layoutY + item.region.layoutH), 30);
+  region.layoutY = last + 24;
+}
+
+function normalizeLongLayout() {
+  let y = 28;
+  state.images.forEach((image) => {
+    const regions = image.regions.length ? image.regions : [image.syntheticRegion];
+    regions.forEach((region) => {
+      if (!region.layoutW || !region.layoutH) initializeRegionLayout(region, image);
+      if (!region.userMoved) { region.layoutX = 28; region.layoutY = y; }
+      y = Math.max(y, region.layoutY + region.layoutH + 24);
+    });
+    y += 20;
   });
 }
 
 function renderStats() {
   const image = currentImage();
-  const regions = image?.regions || [];
+  const regions = state.images.flatMap((item) => item.regions || []);
   const groups = new Set(regions.map((r) => r.group).filter(Boolean));
   $("#regionCount").textContent = `${regions.length} 个内容块`;
   $("#groupCount").textContent = `${groups.size} 个编号集合`;
@@ -166,28 +229,29 @@ function bindEvents() {
 
 function setTool(tool) { state.tool = tool; setToolVisuals(); $("#canvasFrame").classList.toggle("painting", tool === "brush"); }
 function setToolVisuals() { $$(".tool-button").forEach((button) => button.classList.toggle("active", button.dataset.tool === state.tool)); const name = { select: "选择", draw: "分区", brush: "涂白", cover: "覆盖" }[state.tool]; $("#toolHint").textContent = name; }
-function applyZoom() { $("#zoomLabel").textContent = `${Math.round(state.zoom * 100)}%`; $("#canvasWrap").style.width = `${Math.min(94, 74 * state.zoom)}%`; }
+function applyZoom() { $("#zoomLabel").textContent = `${Math.round(state.zoom * 100)}%`; const canvas = $("#outputCanvas"); if (canvas) canvas.style.zoom = state.zoom; $("#canvasWrap").style.width = "820px"; }
 
 function startRegionPointer(event, box) {
   if (state.tool !== "select") return;
   event.stopPropagation(); event.preventDefault();
-  const region = currentImage()?.regions.find((item) => item.id === box.dataset.regionId); if (!region) return;
-  state.selectedRegionId = region.id; renderInspector(); renderRegions();
-  const frameRect = $("#canvasFrame").getBoundingClientRect(); const resize = event.target.classList.contains("resize-handle"); const sx = event.clientX; const sy = event.clientY; const original = { ...region };
-  const move = (moveEvent) => { const dx = (moveEvent.clientX - sx) / frameRect.width * 100; const dy = (moveEvent.clientY - sy) / frameRect.height * 100; if (resize) { region.w = clamp(original.w + dx, 2, 100 - original.x); region.h = clamp(original.h + dy, 2, 100 - original.y); } else { region.x = clamp(original.x + dx, 0, 100 - region.w); region.y = clamp(original.y + dy, 0, 100 - region.h); } renderRegions(); renderInspector(); };
+  const image = state.images.find((item) => item.id === box.dataset.imageId); const region = image?.regions.find((item) => item.id === box.dataset.regionId); if (!region) return;
+  state.currentId = image.id; state.selectedRegionId = region.id; renderInspector(); renderRegions();
+  const canvasRect = $("#outputCanvas").getBoundingClientRect(); const sx = event.clientX; const sy = event.clientY; const original = { x: region.layoutX || 28, y: region.layoutY || 28 };
+  const scale = state.zoom || 1;
+  const move = (moveEvent) => { const dx = (moveEvent.clientX - sx) / scale; const dy = (moveEvent.clientY - sy) / scale; region.layoutX = clamp(original.x + dx, 8, Math.max(8, 800 - (region.layoutW || 160))); region.layoutY = Math.max(8, original.y + dy); region.userMoved = true; renderRegions(); renderInspector(); };
   const up = () => { pushHistory(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
   window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
 }
 
 function startCanvasPointer(event) {
-  if (event.target.closest(".region-box") || !currentImage()) return;
-  const frameRect = $("#canvasFrame").getBoundingClientRect(); const start = normPoint(event.clientX, event.clientY, frameRect);
+  if (event.target.closest(".region-box, .region-tile") || !currentImage()) return;
+  const canvasRect = $("#outputCanvas").getBoundingClientRect(); const start = canvasPoint(event.clientX, event.clientY, canvasRect);
   if (state.tool === "draw" || state.tool === "cover") {
     event.preventDefault(); let preview;
-    if (state.tool === "draw") { preview = document.createElement("div"); preview.className = "region-box selected"; preview.style.cssText = `left:${start.x}%;top:${start.y}%;width:0;height:0;border-style:dashed`; $("#regionLayer").appendChild(preview); }
-    else { preview = document.createElement("div"); preview.style.cssText = `position:absolute;left:${start.x}%;top:${start.y}%;width:0;height:0;background:rgba(255,255,255,.8);z-index:4`; $("#regionLayer").appendChild(preview); }
-    const move = (moveEvent) => { const now = normPoint(moveEvent.clientX, moveEvent.clientY, frameRect); const box = rectFromPoints(start, now); preview.style.left = `${box.x}%`; preview.style.top = `${box.y}%`; preview.style.width = `${box.w}%`; preview.style.height = `${box.h}%`; };
-    const up = (upEvent) => { const now = normPoint(upEvent.clientX, upEvent.clientY, frameRect); const box = rectFromPoints(start, now); preview.remove(); if (box.w > 1 && box.h > 1) { pushHistory(); if (state.tool === "draw") { const region = { id: `manual-${Date.now()}`, label: "手动分区", kind: "other", ...box, confidence: 1, group: nextGroup(), description: "人工创建的语义区域" }; currentImage().regions.push(region); state.selectedRegionId = region.id; } else { (state.whiteRects[state.currentId] ||= []).push(box); } render(); } window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+    if (state.tool === "draw") { preview = document.createElement("div"); preview.className = "region-box selected"; preview.style.cssText = `left:${start.x}px;top:${start.y}px;width:0;height:0;border-style:dashed`; $("#regionLayer").appendChild(preview); }
+    else { preview = document.createElement("div"); preview.style.cssText = `position:absolute;left:${start.x}px;top:${start.y}px;width:0;height:0;background:rgba(255,255,255,.8);z-index:4`; $("#regionLayer").appendChild(preview); }
+    const move = (moveEvent) => { const now = canvasPoint(moveEvent.clientX, moveEvent.clientY, canvasRect); const box = rectFromPoints(start, now); preview.style.left = `${box.x}px`; preview.style.top = `${box.y}px`; preview.style.width = `${box.w}px`; preview.style.height = `${box.h}px`; };
+    const up = (upEvent) => { const now = canvasPoint(upEvent.clientX, upEvent.clientY, canvasRect); const box = rectFromPoints(start, now); preview.remove(); if (box.w > 8 && box.h > 8) { pushHistory(); if (state.tool === "draw") { const source = currentImage(); const region = { id: `manual-${Date.now()}`, label: "手动分区", kind: "other", x: box.x / 760 * 100, y: 0, w: box.w / 760 * 100, h: 20, confidence: 1, group: nextGroup(), description: "人工创建的裁剪区域", layoutX: box.x, layoutY: box.y, layoutW: box.w, layoutH: box.h, userMoved: true }; source.regions.push(region); state.selectedRegionId = region.id; region.cropSrc = null; } else { state.layoutWhiteRects.push(box); } render(); } window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
     window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
   }
 }
@@ -195,19 +259,20 @@ function startCanvasPointer(event) {
 function startBrushStroke(event) {
   if (state.tool !== "brush" || !currentImage()) return;
   event.preventDefault();
-  const rect = $("#canvasFrame").getBoundingClientRect();
-  const path = { size: 3.2, points: [normPoint(event.clientX, event.clientY, rect)] };
-  (state.paintPaths[state.currentId] ||= []).push(path);
-  const move = (moveEvent) => { path.points.push(normPoint(moveEvent.clientX, moveEvent.clientY, rect)); drawPaint(); };
+  const rect = $("#outputCanvas").getBoundingClientRect();
+  const path = { size: 8, points: [canvasPoint(event.clientX, event.clientY, rect)] };
+  state.layoutPaintPaths.push(path);
+  const move = (moveEvent) => { path.points.push(canvasPoint(moveEvent.clientX, moveEvent.clientY, rect)); drawPaint(); };
   const up = () => { pushHistory(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
   window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
 }
 
+function canvasPoint(clientX, clientY, rect) { const scale = state.zoom || 1; return { x: Math.max(0, (clientX - rect.left) / scale), y: Math.max(0, (clientY - rect.top) / scale) }; }
 function normPoint(clientX, clientY, rect) { return { x: clamp((clientX - rect.left) / rect.width * 100, 0, 100), y: clamp((clientY - rect.top) / rect.height * 100, 0, 100) }; }
 function rectFromPoints(a, b) { return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) }; }
 function clamp(value, min, max) { return Math.max(min, Math.min(max, Number(value) || 0)); }
 function nextGroup() { const groups = new Set((currentImage()?.regions || []).map((region) => region.group)); let n = 1; while (groups.has(String.fromCharCode(64 + n))) n++; return String.fromCharCode(64 + n); }
-function updateSelected(key, value) { const region = selectedRegion(); if (!region) return; pushHistory(); if (["x", "y", "w", "h"].includes(key)) value = clamp(value, key === "w" || key === "h" ? 1 : 0, 100); region[key] = value; if (key === "x") region.w = Math.min(region.w, 100 - value); if (key === "y") region.h = Math.min(region.h, 100 - value); render(); }
+function updateSelected(key, value) { const region = selectedRegion(); if (!region) return; pushHistory(); if (["x", "y", "w", "h"].includes(key)) value = clamp(value, key === "w" || key === "h" ? 1 : 0, 100); region[key] = value; if (key === "x") region.w = Math.min(region.w, 100 - value); if (key === "y") region.h = Math.min(region.h, 100 - value); if (["x", "y", "w", "h"].includes(key)) region.cropSrc = null; render(); }
 
 async function handleFiles(files) {
   if (!files.length) return;
@@ -241,7 +306,7 @@ async function segmentCurrent() {
     let result;
     if (image.src.startsWith("data:image/")) { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); }
     else { result = { regions: structuredClone(demoRegions), source: "offline" }; }
-    pushHistory(); image.regions = (result.regions || []).map((region, index) => ({ ...region, id: region.id || `region-${Date.now()}-${index}` })); image.analyzed = true; state.selectedRegionId = image.regions[0]?.id || null; state.lastAnalyzed = "刚刚"; render(); showToast(result.source === "qwen" ? "Qwen 已完成语义分区" : "已使用离线演示分区（可继续手动调整）", result.source === "qwen" ? "success" : "warn");
+    pushHistory(); image.regions = (result.regions || []).map((region, index) => ({ ...region, id: region.id || `region-${Date.now()}-${index}`, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null, userMoved: false })); image.previewReady = false; image.analyzed = true; state.selectedRegionId = image.regions[0]?.id || null; state.lastAnalyzed = "刚刚"; render(); showToast(result.source === "qwen" ? "Qwen 已完成语义分区并裁剪内容块" : "已使用离线演示分区（可继续手动调整）", result.source === "qwen" ? "success" : "warn");
   } catch (error) { showToast(error.message || "分析失败，请稍后重试", "error"); }
   finally { button.disabled = false; button.innerHTML = "<span>✦</span>分析当前图片"; }
 }
@@ -254,7 +319,7 @@ async function segmentAll() {
   try {
     for (const image of candidates) {
       state.currentId = image.id; render();
-      try { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); image.regions = result.regions || []; image.analyzed = true; completed++; } catch { image.regions = structuredClone(demoRegions); image.analyzed = true; completed++; }
+      try { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); image.regions = (result.regions || []).map((region) => ({ ...region, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null })); image.previewReady = false; image.analyzed = true; completed++; } catch { image.regions = structuredClone(demoRegions).map((region) => ({ ...region, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null })); image.previewReady = false; image.analyzed = true; completed++; }
     }
     render(); showToast(`已完成 ${completed} 张图片的语义分区`, "success");
   } finally { batchButton.disabled = false; batchButton.textContent = "批量分析素材队列"; }
@@ -268,18 +333,18 @@ async function importWebpage() {
   finally { $("#importUrlButton").disabled = false; }
 }
 
-function resizePaintCanvas() { const canvas = $("#paintLayer"); const frame = $("#canvasFrame"); if (!frame || !frame.clientWidth) return; const ratio = window.devicePixelRatio || 1; canvas.width = Math.round(frame.clientWidth * ratio); canvas.height = Math.round(frame.clientHeight * ratio); canvas.style.width = `${frame.clientWidth}px`; canvas.style.height = `${frame.clientHeight}px`; }
+function resizePaintCanvas() { const canvas = $("#paintLayer"); const frame = $("#outputCanvas"); if (!frame || !frame.clientWidth) return; const ratio = window.devicePixelRatio || 1; canvas.width = Math.round(frame.clientWidth * ratio); canvas.height = Math.round(frame.clientHeight * ratio); canvas.style.width = `${frame.clientWidth}px`; canvas.style.height = `${frame.clientHeight}px`; }
 function drawPaint() {
-  const image = currentImage(); const canvas = $("#paintLayer"); if (!canvas.width) return; const ctx = canvas.getContext("2d"); const scale = window.devicePixelRatio || 1; ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.save(); ctx.scale(scale, scale); const rect = $("#canvasFrame").getBoundingClientRect();
-  (state.whiteRects[image?.id] || []).forEach((item) => { ctx.fillStyle = "rgba(255,255,255,.94)"; ctx.fillRect(item.x / 100 * rect.width, item.y / 100 * rect.height, item.w / 100 * rect.width, item.h / 100 * rect.height); });
-  (state.paintPaths[image?.id] || []).forEach((path) => { if (path.points.length < 2) return; ctx.strokeStyle = "rgba(255,255,255,.96)"; ctx.lineWidth = path.size / 100 * rect.width; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.beginPath(); path.points.forEach((point, index) => index ? ctx.lineTo(point.x / 100 * rect.width, point.y / 100 * rect.height) : ctx.moveTo(point.x / 100 * rect.width, point.y / 100 * rect.height)); ctx.stroke(); });
+  const canvas = $("#paintLayer"); if (!canvas.width) return; const ctx = canvas.getContext("2d"); const scale = window.devicePixelRatio || 1; ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.save(); ctx.scale(scale, scale);
+  state.layoutWhiteRects.forEach((item) => { ctx.fillStyle = "rgba(255,255,255,.98)"; ctx.fillRect(item.x, item.y, item.w, item.h); });
+  state.layoutPaintPaths.forEach((path) => { if (path.points.length < 1) return; ctx.strokeStyle = "rgba(255,255,255,.98)"; ctx.lineWidth = path.size; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.beginPath(); path.points.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y)); ctx.stroke(); });
   ctx.restore();
 }
 
-function clearWhiteouts() { const image = currentImage(); if (!image) return; pushHistory(); state.whiteRects[image.id] = []; state.paintPaths[image.id] = []; drawPaint(); showToast("已清除当前图片的涂白", "success"); }
+function clearWhiteouts() { const image = currentImage(); if (!image) return; pushHistory(); state.whiteRects[image.id] = []; state.paintPaths[image.id] = []; state.layoutWhiteRects = []; state.layoutPaintPaths = []; renderRegions(); drawPaint(); showToast("已清除当前画布的涂白", "success"); }
 function deleteSelected() { const image = currentImage(); if (!image || !state.selectedRegionId) return showToast("请先选择一个内容块", "warn"); pushHistory(); image.regions = image.regions.filter((region) => region.id !== state.selectedRegionId); state.selectedRegionId = image.regions[0]?.id || null; render(); showToast("内容块已移除", "success"); }
 
-function saveProject() { const data = { version: 1, projectName: state.projectName, images: state.images, whiteRects: state.whiteRects, paintPaths: state.paintPaths, exportedAt: new Date().toISOString() }; const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${state.projectName || "draft-reformat"}.draft.json`; link.click(); URL.revokeObjectURL(link.href); showToast("项目 JSON 已保存", "success"); }
+function saveProject() { const images = state.images.map((image) => ({ ...image, regions: image.regions.map(({ cropSrc, ...region }) => region), syntheticRegion: image.syntheticRegion ? (({ cropSrc, ...region }) => region)(image.syntheticRegion) : undefined })); const data = { version: 2, projectName: state.projectName, images, whiteRects: state.whiteRects, paintPaths: state.paintPaths, layoutWhiteRects: state.layoutWhiteRects, layoutPaintPaths: state.layoutPaintPaths, exportedAt: new Date().toISOString() }; const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${state.projectName || "draft-reformat"}.draft.json`; link.click(); URL.revokeObjectURL(link.href); showToast("项目 JSON 已保存", "success"); }
 
 async function exportFinal() {
   if (!state.images.length) return showToast("请先加入图片素材", "warn");
@@ -292,12 +357,13 @@ async function buildExportHtml() {
   for (const image of state.images) {
     const groups = new Map();
     (image.regions.length ? image.regions : [{ id: "full", label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, group: "未分组", confidence: 1 }]).forEach((region) => { const key = state.keepGroups ? (region.group || region.id) : region.id; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(region); });
-    for (const [group, regions] of groups) { const crops = []; for (const region of regions) crops.push({ region, src: await cropRegion(image, region) }); blocks.push({ group, image, regions: crops, height: regions.reduce((sum, region) => sum + region.h, 0) + 5 }); }
+    for (const [group, regions] of groups) { const crops = []; for (const region of regions) crops.push({ region, src: region.cropSrc || await cropRegion(image, region) }); blocks.push({ group, image, regions: crops, y: Math.min(...regions.map((region) => region.layoutY || 0)), height: regions.reduce((sum, region) => sum + (region.layoutH || region.h * 8), 0) + 28 }); }
   }
-  const pages = []; let page = []; let used = 0; const limit = 78;
-  blocks.forEach((block) => { const blockHeight = Math.max(13, Math.min(80, block.height)); if (page.length && used + blockHeight > limit) { pages.push(page); page = []; used = 0; } page.push(block); used += blockHeight; }); if (page.length) pages.push(page);
+  blocks.sort((a, b) => a.y - b.y);
+  const pages = []; let page = []; let used = 0; const limit = $("#pageSize").value === "a3" ? 1240 : 840;
+  blocks.forEach((block) => { const blockHeight = Math.max(90, Math.min(1250, block.height)); if (page.length && used + blockHeight > limit) { pages.push(page); page = []; used = 0; } page.push(block); used += blockHeight; }); if (page.length) pages.push(page);
   const size = $("#pageSize").value; const margin = $("#marginRange").value;
-  const pagesHtml = pages.map((items, index) => `<section class="print-page"><div class="page-header"><div><span class="print-kicker">DRAFT REFORMAT · FINAL</span><h1>${escapeHtml(state.projectName)}</h1></div><span class="page-no">${String(index + 1).padStart(2, "0")} / ${String(pages.length).padStart(2, "0")}</span></div>${items.map((block) => `<div class="print-group"><div class="group-title"><span>集合 ${escapeHtml(block.group)}</span><i></i><small>${escapeHtml(block.image.name)}</small></div>${block.regions.map((item) => `<article class="print-block"><img src="${item.src}" alt="${escapeHtml(item.region.label)}"/><div class="print-caption"><b>${escapeHtml(item.region.label)}</b><span>${kindNames[item.region.kind] || "内容区域"}</span></div></article>`).join("")}</div>`).join("")}<div class="page-footer"><span>语义分区 · 人工校订 · 集合不拆页</span><span>${new Date().toLocaleDateString("zh-CN")}</span></div></section>`).join("");
+  const pagesHtml = pages.map((items, index) => `<section class="print-page"><div class="page-header"><div><span class="print-kicker">DRAFT REFORMAT · FINAL</span><h1>${escapeHtml(state.projectName)}</h1></div><span class="page-no">${String(index + 1).padStart(2, "0")} / ${String(pages.length).padStart(2, "0")}</span></div>${items.map((block) => `<div class="print-group"><div class="group-title"><span>集合 ${escapeHtml(block.group)}</span><i></i><small>${escapeHtml(block.image.name)}</small></div>${block.regions.map((item) => `<article class="print-block" style="margin-left:${Math.min(110, Math.max(0, item.region.layoutX || 0))}px"><img src="${item.src}" alt="${escapeHtml(item.region.label)}"/><div class="print-caption"><b>${escapeHtml(item.region.label)}</b><span>${kindNames[item.region.kind] || "内容区域"}</span></div></article>`).join("")}</div>`).join("")}<div class="page-footer"><span>语义裁剪 · 人工校订 · 集合不拆页</span><span>${new Date().toLocaleDateString("zh-CN")}</span></div></section>`).join("");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(state.projectName)} · 终稿</title><style>@page{size:${size} portrait;margin:0}*{box-sizing:border-box}body{margin:0;background:#e7e8eb;color:#20232b;font-family:Inter,Arial,"Microsoft YaHei",sans-serif}.print-page{width:${size === "a3" ? "1123px" : "794px"};min-height:${size === "a3" ? "1587px" : "1123px"};padding:${margin}px;page-break-after:always;background:#fff;margin:24px auto;display:flex;flex-direction:column}.page-header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #d9dce2;padding-bottom:15px;margin-bottom:20px}.print-kicker{font-size:8px;letter-spacing:.2em;color:#765fce;font-weight:bold}.page-header h1{margin:7px 0 0;font-size:22px;letter-spacing:-.02em}.page-no{font-size:10px;color:#8a919d;border:1px solid #dfe2e8;padding:5px 7px;border-radius:4px}.print-group{border:1px solid #e2e4e8;border-radius:7px;padding:12px;margin-bottom:14px;break-inside:avoid}.group-title{font-size:10px;color:#6e5bb7;display:flex;align-items:center;gap:8px;margin-bottom:10px}.group-title i{height:1px;background:#ebeaf1;flex:1}.group-title small{font-size:8px;color:#9aa0aa;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.print-block{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end;margin-top:8px;break-inside:avoid}.print-block img{max-width:100%;width:100%;max-height:490px;object-fit:contain;object-position:left top;border:1px solid #eff0f2;border-radius:3px;background:#fcfcfc}.print-caption{font-size:9px;color:#606873;white-space:nowrap;writing-mode:vertical-rl;max-height:130px}.print-caption b{color:#303641;font-size:10px;margin-bottom:5px}.page-footer{margin-top:auto;padding-top:16px;border-top:1px solid #e6e7e9;display:flex;justify-content:space-between;color:#a0a6af;font-size:8px}@media print{body{background:#fff}.print-page{margin:0;box-shadow:none}}@media screen{.print-page{box-shadow:0 10px 35px rgba(30,33,40,.13)}}.print-help{position:fixed;right:20px;top:20px;background:#27243d;color:#eee;padding:10px 13px;border-radius:6px;font-size:11px}@media print{.print-help{display:none}}</style></head><body><div class="print-help">已生成 ${pages.length} 页 · 使用 Ctrl/Cmd + P 保存为 PDF</div>${pagesHtml}<script>setTimeout(()=>window.print(),600)<\/script></body></html>`;
 }
 

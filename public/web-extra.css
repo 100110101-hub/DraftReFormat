@@ -4,3 +4,27 @@
 .ai-batch-button { width: 100%; margin-top: 7px; padding: 6px; border-radius: 5px; color: #8e86ad; background: transparent; border: 1px solid #343047; font-size: 9px; }
 .ai-batch-button:hover { border-color: #6557a0; color: #c4b7ff; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* The editor surface is a real, white, continuous canvas. Content blocks are
+   cropped images, not translucent selection rectangles. */
+.canvas-area { align-items: flex-start; justify-content: center; overflow: auto; background: #dfe3ea; background-image: none; padding: 22px 20px 42px; }
+.canvas-area:before { display: none; }
+.canvas-wrap { width: 820px !important; max-height: none; min-height: 1120px; align-items: flex-start; justify-content: center; }
+.canvas-frame { width: 820px; max-width: none; max-height: none; overflow: visible; background: #fff; box-shadow: 0 18px 42px rgba(33, 39, 52, .18), 0 0 0 1px #cfd4de; line-height: normal; }
+.long-canvas { position: relative; width: 820px; min-height: 1120px; background: #fff; overflow: visible; transform-origin: top center; }
+.long-canvas #regionLayer, .long-canvas #paintLayer { position: absolute; inset: 0; width: 100%; height: 100%; }
+.long-canvas #regionLayer { z-index: 3; }
+.long-canvas #paintLayer { z-index: 7; pointer-events: none; }
+.canvas-frame.painting #paintLayer { pointer-events: auto; cursor: crosshair; }
+.region-tile { position: absolute; overflow: hidden; border: 1px solid #d5dbe4; border-radius: 3px; background: #fff; box-shadow: 0 3px 11px rgba(45, 53, 67, .10); cursor: grab; transition: box-shadow .14s, border-color .14s; z-index: 2; }
+.region-tile:hover, .region-tile.selected { border-color: #8a75ea !important; box-shadow: 0 0 0 2px rgba(133, 117, 255, .18), 0 7px 19px rgba(45, 53, 67, .16); }
+.region-tile:active { cursor: grabbing; }
+.region-tile > img { display: block; width: 100%; height: 100%; object-fit: fill; user-select: none; pointer-events: none; }
+.tile-label { position: absolute; top: 7px; left: 7px; right: 7px; display: flex; justify-content: space-between; align-items: center; gap: 7px; pointer-events: none; opacity: 0; transition: opacity .14s; }
+.region-tile:hover .tile-label, .region-tile.selected .tile-label { opacity: 1; }
+.tile-label span { color: #fff; background: rgba(32, 29, 61, .84); padding: 4px 6px; border-radius: 4px; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile-label i { font-style: normal; color: #302c48; background: rgba(255,255,255,.87); padding: 3px 5px; border-radius: 4px; font-size: 8px; }
+.tile-kind { position: absolute; right: 7px; bottom: 6px; color: #5c6571; background: rgba(255,255,255,.82); padding: 2px 4px; border-radius: 3px; font-size: 7px; letter-spacing: .08em; pointer-events: none; opacity: 0; }
+.region-tile:hover .tile-kind, .region-tile.selected .tile-kind { opacity: 1; }
+.layout-whiteout { position: absolute; z-index: 6; background: #fff; pointer-events: none; }
+.stage-help { bottom: 12px; color: #687384; background: rgba(235, 237, 241, .84); padding: 4px 8px; border-radius: 4px; }

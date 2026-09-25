@@ -135,12 +135,13 @@ def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]]
 
     prompt = f"""你是文档版面分析与语义分割专家。请分析这张草稿截图，给出适合后续编辑和分页的语义区域。
 要求：
-1. 区域可以是不规则语义块，但输出用覆盖整个内容的最小矩形表示；不要为了凑正方形而切断公式、化学结构式、图注或生物图片。
-2. 文字段落、题目、插图、表格、化学结构式、数学公式、生物图片分别识别。
+1. 这是“裁剪区域”识别，不是给整页画几个大框。每个题号、段落、图表、结构式、公式都要成为独立且紧致的内容块，尽量贴合可见内容，排除周围空白；相邻内容只有在语义上不可分时才合并。
+2. 区域可以是不规则语义块，但输出用覆盖该内容的最小矩形表示；不要为了凑正方形而切断公式、化学结构式、图注或生物图片，也不要让一个框横跨多个无关对象。
+3. 文字段落、题目、插图、表格、化学结构式、数学公式、生物图片分别识别。
 3. 同属一个题目/图片编号集合的区域使用相同 group（例如 1、1a、1b 都用 group=\"1\"）。
 4. 坐标为相对于原图的百分比 0-100，x/y 是左上角，w/h 是宽高；只输出 JSON，不要 Markdown。
 5. label 使用简短中文，kind 只能是 text/image/table/chemistry/biology/formula/other。
-6. 过滤页眉、页脚、装饰线和大面积空白；至少保留一个主内容区域。
+6. 过滤页眉、页脚、装饰线和大面积空白；对每个真实内容给出边界，至少保留一个主内容区域。
 用户补充：{hint or '无'}
 输出格式：{{\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""
     payload = {
@@ -186,10 +187,16 @@ def normalize_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for index, region in enumerate(regions[:40]):
         try:
-            x = max(0, min(100, float(region.get("x", 0))))
-            y = max(0, min(100, float(region.get("y", 0))))
-            w = max(1, min(100 - x, float(region.get("w", 10))))
-            h = max(1, min(100 - y, float(region.get("h", 10))))
+            bbox = region.get("bbox") if isinstance(region.get("bbox"), list) else None
+            raw_x = bbox[0] if bbox and len(bbox) >= 4 else region.get("x", 0)
+            raw_y = bbox[1] if bbox and len(bbox) >= 4 else region.get("y", 0)
+            raw_w = (bbox[2] - bbox[0]) if bbox and len(bbox) >= 4 else region.get("w", 10)
+            raw_h = (bbox[3] - bbox[1]) if bbox and len(bbox) >= 4 else region.get("h", 10)
+            scale = 0.1 if max(abs(float(raw_x or 0)), abs(float(raw_y or 0)), abs(float(raw_w or 0)), abs(float(raw_h or 0))) > 100 else 1
+            x = max(0, min(100, float(raw_x) * scale))
+            y = max(0, min(100, float(raw_y) * scale))
+            w = max(1, min(100 - x, float(raw_w) * scale))
+            h = max(1, min(100 - y, float(raw_h) * scale))
             item = {
                 "id": str(region.get("id") or f"region-{index + 1}"),
                 "label": str(region.get("label") or "语义区域")[:40],

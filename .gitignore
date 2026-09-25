@@ -1,5 +1,6 @@
 .env
 .venv/
 __pycache__/
+ui-long-canvas*.png
 *.pyc
 uploads/

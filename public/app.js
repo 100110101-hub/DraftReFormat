@@ -105,7 +105,7 @@ function renderAssets() {
 function renderRegions() {
   const layer = $("#regionLayer");
   const items = visualRegions();
-  layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${items.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX || 28}px;top:${region.layoutY || 28}px;width:${region.layoutW || 240}px;height:${region.layoutH || 120}px;border-color:${kindColors[region.kind] || kindColors.other};z-index:${region.zIndex || 2}">
+  layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${items.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX || 28}px;top:${region.layoutY || 28}px;width:${region.layoutW || 1}px;height:${region.layoutH || 1}px;border-color:${kindColors[region.kind] || kindColors.other};z-index:${region.zIndex || 2}">
     <img src="${region.cropSrc || image.src}" alt="${escapeHtml(region.label)}" draggable="false"/><div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span><button class="tile-delete" data-delete-region="${region.id}" title="删除内容块">×</button></div>`).join("")}`;
   $$(".region-tile").forEach((box) => {
     box.addEventListener("pointerdown", (event) => startRegionPointer(event, box));
@@ -128,7 +128,7 @@ function visualRegions() {
 
 function updateOutputCanvasSize(items) {
   const canvas = $("#outputCanvas"); if (!canvas) return;
-  const bottom = items.reduce((max, item) => Math.max(max, (item.region.layoutY || 28) + (item.region.layoutH || 120)), 0);
+  const bottom = items.reduce((max, item) => Math.max(max, (item.region.layoutY || 28) + (item.region.layoutH || 1)), 0);
   canvas.style.height = `${Math.max(1120, bottom + 44)}px`;
   canvas.style.minHeight = `${Math.max(1120, bottom + 44)}px`;
 }
@@ -138,7 +138,14 @@ async function hydrateVisualRegions() {
   try {
     const items = visualRegions();
     for (const { image, region } of items) {
-      if (!image.aspect) image.aspect = await imageAspect(image.src);
+      if (!image.aspect || !image.sourceWidth) {
+        const size = await imageSize(image.src);
+        image.sourceWidth = size.width;
+        image.sourceHeight = size.height;
+        image.aspect = size.width && size.height ? size.width / size.height : .72;
+        // Fit large source images to the canvas, but never upscale a small one.
+        image.displayScale = Math.min(1, 760 / Math.max(1, image.sourceWidth));
+      }
       if (region.synthetic) { region.layoutW = 740; region.layoutH = Math.round(740 / (image.aspect || .72)); }
       else if (!region.layoutW || !region.layoutH) initializeRegionLayout(region, image);
       if (!region.cropSrc && !region.synthetic) region.cropSrc = await cropRegion(image, region);
@@ -152,14 +159,14 @@ async function hydrateVisualRegions() {
   }
 }
 
-function imageAspect(src) { return new Promise((resolve) => { const img = new Image(); img.onload = () => resolve(img.naturalWidth && img.naturalHeight ? img.naturalWidth / img.naturalHeight : .72); img.onerror = () => resolve(.72); img.src = src; }); }
+function imageSize(src) { return new Promise((resolve) => { const img = new Image(); img.onload = () => resolve({ width: img.naturalWidth || 760, height: img.naturalHeight || Math.round(760 / .72) }); img.onerror = () => resolve({ width: 760, height: Math.round(760 / .72) }); img.src = src; }); }
 
 function initializeRegionLayout(region, image) {
-  const width = Math.max(150, Math.min(760, 760 * region.w / 100));
-  region.layoutW = Math.round(width);
-  // The crop's aspect is (sourceAspect * w%) / h%; with a tile width of
-  // baseWidth * w%, the matching height is baseWidth * h% / sourceAspect.
-  region.layoutH = Math.round(Math.max(54, 760 * region.h / 100 / (image.aspect || .72)));
+  const baseWidth = Math.min(760, image.sourceWidth || 760);
+  const scale = image.displayScale || (baseWidth / Math.max(1, image.sourceWidth || baseWidth));
+  // Keep the crop's native proportions and never enlarge a source image.
+  region.layoutW = Math.max(1, Math.round((image.sourceWidth || baseWidth) * region.w / 100 * scale));
+  region.layoutH = Math.max(1, Math.round((image.sourceHeight || baseWidth / (image.aspect || .72)) * region.h / 100 * scale));
   region.layoutX = 28;
   const all = visualRegions().filter(({ region: item }) => item !== region && item.layoutY != null);
   const last = all.reduce((max, item) => Math.max(max, item.region.layoutY + item.region.layoutH), 30);
@@ -250,7 +257,7 @@ function startRegionPointer(event, box) {
   state.currentId = image.id; state.selectedRegionId = region.id; renderInspector(); renderRegions();
   const canvasRect = $("#outputCanvas").getBoundingClientRect(); const sx = event.clientX; const sy = event.clientY; const original = { x: region.layoutX || 28, y: region.layoutY || 28 };
   const scale = state.zoom || 1;
-  const move = (moveEvent) => { const dx = (moveEvent.clientX - sx) / scale; const dy = (moveEvent.clientY - sy) / scale; region.layoutX = clamp(original.x + dx, 8, Math.max(8, 800 - (region.layoutW || 160))); region.layoutY = Math.max(8, original.y + dy); region.userMoved = true; renderRegions(); renderInspector(); };
+  const move = (moveEvent) => { const dx = (moveEvent.clientX - sx) / scale; const dy = (moveEvent.clientY - sy) / scale; region.layoutX = clamp(original.x + dx, 8, Math.max(8, 800 - (region.layoutW || 1))); region.layoutY = Math.max(8, original.y + dy); region.userMoved = true; renderRegions(); renderInspector(); };
   const up = () => { pushHistory(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
   window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
 }
@@ -326,31 +333,15 @@ function applyAnalysisResult(image, result) {
   render();
 }
 
-function watchSupervision(image, jobId) {
-  if (!jobId) return;
-  const poll = async () => {
-    if (!image.supervisionPending || image.supervisionJobId !== jobId) return;
-    try {
-      const response = await fetch(`/api/segment-status?jobId=${encodeURIComponent(jobId)}`);
-      if (!response.ok) throw new Error("监督任务暂时不可用");
-      const result = await response.json();
-      if (result.status !== "complete") return setTimeout(poll, 2500);
-      image.supervisionPending = false;
-      image.supervisionJobId = null;
-      if (image.supervisionUserEdited) {
-        image.supervisionResult = result;
-        if (state.currentId === image.id) showToast("监督审校已完成；检测到你已手动修改，未覆盖当前编辑", "warn");
-        return;
-      }
-      image.applyingSupervision = true;
-      applyAnalysisResult(image, { regions: result.regions || image.regions, supervision: result.supervision || null });
-      image.applyingSupervision = false;
-      if (state.currentId === image.id) showToast(`后台监督审校完成（${result.supervision?.rounds || 1} 轮）`, result.supervision?.status === "pass" ? "success" : "warn");
-    } catch {
-      setTimeout(poll, 4000);
-    }
-  };
-  setTimeout(poll, 1200);
+async function waitForSupervision(jobId, initialResult) {
+  if (!jobId) return initialResult;
+  while (true) {
+    const response = await fetch(`/api/segment-status?jobId=${encodeURIComponent(jobId)}`);
+    if (!response.ok) throw new Error("监督任务暂时不可用");
+    const result = await response.json();
+    if (result.status === "complete") return { ...initialResult, regions: result.regions || initialResult.regions, source: "qwen-supervised", supervision: result.supervision || null, jobId: null };
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+  }
 }
 
 async function segmentCurrent() {
@@ -360,13 +351,9 @@ async function segmentCurrent() {
     let result;
     if (image.src.startsWith("data:image/")) { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); }
     else { result = { regions: structuredClone(demoRegions), source: "offline" }; }
+    if (result.jobId) { button.innerHTML = '<span class="spinner"></span>监督审校中…'; result = await waitForSupervision(result.jobId, result); }
     applyAnalysisResult(image, result);
-    if (result.jobId) {
-      showToast("首轮分区已返回，监督审校在后台继续", "success");
-      watchSupervision(image, result.jobId);
-    } else {
-      showToast(result.source === "qwen-supervised" ? `Qwen 分割 + 监督审校完成（${result.supervision?.rounds || 1} 轮）` : "已使用离线演示分区（可继续手动调整）", result.source === "qwen-supervised" ? "success" : "warn");
-    }
+    showToast(result.source === "qwen-supervised" ? `Qwen 分割 + 监督审校完成（${result.supervision?.rounds || 1} 轮）` : "已使用离线演示分区（可继续手动调整）", result.source === "qwen-supervised" ? "success" : "warn");
   } catch (error) { showToast(error.message || "分析失败，请稍后重试", "error"); }
   finally { button.disabled = false; button.innerHTML = "<span>✦</span>分析当前图片"; }
 }
@@ -374,14 +361,22 @@ async function segmentCurrent() {
 async function segmentAll() {
   const candidates = state.images.filter((image) => image.src.startsWith("data:image/") && !image.analyzed);
   if (!candidates.length) return showToast("队列中的图片都已分析，可继续人工调整", "warn");
-  const batchButton = $("#segmentAllButton"); batchButton.disabled = true; batchButton.innerHTML = '<span class="spinner"></span>批量理解中…';
-  let completed = 0;
+  const batchButton = $("#segmentAllButton"); batchButton.disabled = true; batchButton.innerHTML = '<span class="spinner"></span>并发分析与审校中…';
   try {
-    for (const image of candidates) {
-      state.currentId = image.id; render();
-      try { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); applyAnalysisResult(image, result); if (result.jobId) watchSupervision(image, result.jobId); completed++; } catch { image.regions = structuredClone(demoRegions).map((region) => ({ ...region, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null })); image.previewReady = false; image.analyzed = true; completed++; }
-    }
-    render(); showToast(`已完成 ${completed} 张图片的语义分区`, "success");
+    const results = await Promise.all(candidates.map(async (image) => {
+      try {
+        const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) });
+        let result = await response.json();
+        if (!response.ok) throw new Error(result.error || "分析失败");
+        if (result.jobId) result = await waitForSupervision(result.jobId, result);
+        applyAnalysisResult(image, result);
+        return { ok: true };
+      } catch {
+        applyAnalysisResult(image, { regions: structuredClone(demoRegions), source: "offline", supervision: { status: "error", rounds: 0, audit: [] } });
+        return { ok: false };
+      }
+    }));
+    render(); showToast(`已并发完成 ${results.length} 张图片的语义分区`, "success");
   } finally { batchButton.disabled = false; batchButton.textContent = "批量分析素材队列"; }
 }
 

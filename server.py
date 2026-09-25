@@ -314,7 +314,7 @@ def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]]
 
 
 def start_supervision_job(model_image: str, proposal: list[dict[str, Any]]) -> str:
-    """Continue supervision in the background so the first proposal is visible immediately."""
+    """Continue supervision in the background so multiple jobs can run concurrently."""
 
     job_id = f"segment-{uuid.uuid4().hex}"
     with QWEN_JOBS_LOCK:

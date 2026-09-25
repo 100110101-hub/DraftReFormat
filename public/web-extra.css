@@ -19,12 +19,22 @@
 .region-tile { position: absolute; overflow: hidden; border: 1px solid #d5dbe4; border-radius: 3px; background: #fff; box-shadow: 0 3px 11px rgba(45, 53, 67, .10); cursor: grab; transition: box-shadow .14s, border-color .14s; z-index: 2; }
 .region-tile:hover, .region-tile.selected { border-color: #8a75ea !important; box-shadow: 0 0 0 2px rgba(133, 117, 255, .18), 0 7px 19px rgba(45, 53, 67, .16); }
 .region-tile:active { cursor: grabbing; }
-.region-tile > img { display: block; width: 100%; height: 100%; object-fit: fill; user-select: none; pointer-events: none; }
+.region-tile > img { display: block; width: 100%; height: 100%; object-fit: contain; object-position: left top; user-select: none; pointer-events: none; background: #fff; }
 .tile-label { position: absolute; top: 7px; left: 7px; right: 7px; display: flex; justify-content: space-between; align-items: center; gap: 7px; pointer-events: none; opacity: 0; transition: opacity .14s; }
 .region-tile:hover .tile-label, .region-tile.selected .tile-label { opacity: 1; }
 .tile-label span { color: #fff; background: rgba(32, 29, 61, .84); padding: 4px 6px; border-radius: 4px; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tile-label i { font-style: normal; color: #302c48; background: rgba(255,255,255,.87); padding: 3px 5px; border-radius: 4px; font-size: 8px; }
 .tile-kind { position: absolute; right: 7px; bottom: 6px; color: #5c6571; background: rgba(255,255,255,.82); padding: 2px 4px; border-radius: 3px; font-size: 7px; letter-spacing: .08em; pointer-events: none; opacity: 0; }
 .region-tile:hover .tile-kind, .region-tile.selected .tile-kind { opacity: 1; }
+.tile-delete { position: absolute; right: 7px; top: 7px; width: 19px; height: 19px; border-radius: 4px; color: #fff; background: rgba(54, 34, 47, .86); font-size: 15px; line-height: 17px; opacity: 0; z-index: 2; }
+.region-tile:hover .tile-delete, .region-tile.selected .tile-delete { opacity: 1; }
+.tile-delete:hover { background: #a94e64; }
 .layout-whiteout { position: absolute; z-index: 6; background: #fff; pointer-events: none; }
 .stage-help { bottom: 12px; color: #687384; background: rgba(235, 237, 241, .84); padding: 4px 8px; border-radius: 4px; }
+.asset-item { position: relative; padding-right: 27px; }
+.asset-delete { position: absolute; right: 6px; top: 6px; width: 18px; height: 18px; border-radius: 4px; color: #778090; background: transparent; font-size: 15px; line-height: 16px; opacity: 0; }
+.asset-item:hover .asset-delete, .asset-item.active .asset-delete { opacity: 1; }
+.asset-delete:hover { color: #ff9aa9; background: #35232b; }
+.layer-buttons { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+.layer-buttons button { border: 1px solid #343b49; border-radius: 4px; color: #9aa3b3; background: #171b23; padding: 6px 2px; font-size: 8px; }
+.layer-buttons button:hover { color: #ddd7ff; border-color: #6c5bb9; background: #282249; }

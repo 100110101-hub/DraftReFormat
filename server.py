@@ -176,66 +176,96 @@ def add_coordinate_grid(image_data_url: str) -> str:
         return image_data_url
 
 
-def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str]:
+def qwen_request(model_image: str, prompt: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Make one structured request to the configured Qwen vision model."""
+
     api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
     if not api_key:
-        return heuristic_regions(), "offline"
-
-    model_image = add_coordinate_grid(image_data_url)
-    prompt = f"""你是文档版面分析与语义分割专家。请分析这张草稿截图，给出适合后续编辑和分页的语义区域。
-要求：
-1. 这是“裁剪区域”识别，不是给整页画几个大框。每个题号、段落、图表、结构式、公式都要成为独立且紧致的内容块，尽量贴合可见内容，排除周围空白；相邻内容只有在语义上不可分时才合并。
-2. 区域可以是不规则语义块，但输出用覆盖该内容的最小矩形表示；不要为了凑正方形而切断公式、化学结构式、图注或生物图片，也不要让一个框横跨多个无关对象。
-3. 文字段落、题目、插图、表格、化学结构式、数学公式、生物图片分别识别。
-3. 同属一个题目/图片编号集合的区域使用相同 group（例如 1、1a、1b 都用 group=\"1\"）。
-4. 坐标为相对于原图的百分比 0-100，x/y 是左上角，w/h 是宽高；只输出 JSON，不要 Markdown。
-5. label 使用简短中文，kind 只能是 text/image/table/chemistry/biology/formula/other。
-6. 过滤页眉、页脚、装饰线和大面积空白；对每个真实内容给出边界，至少保留一个主内容区域。
-7. 图片上叠加了蓝色 10% 坐标网格和刻度，左上角为 (0,0)，右下角为 (100,100)。网格、刻度数字不是内容，必须忽略它们；输出坐标仍对应没有网格的原始图片。
-用户补充：{hint or '无'}
-输出格式：{{\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""
+        return None, "API key is not configured"
     payload = {
         "model": QWEN_MODEL,
-        "temperature": 0.1,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": model_image}},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ],
+        "temperature": 0.05,
+        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": model_image}}, {"type": "text", "text": prompt}]}],
     }
-    request = urllib.request.Request(
-        QWEN_ENDPOINT,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    request = urllib.request.Request(QWEN_ENDPOINT, data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=80) as response:
+        with urllib.request.urlopen(request, timeout=90) as response:
             body = json.loads(response.read().decode("utf-8"))
         content = body["choices"][0]["message"]["content"]
         if isinstance(content, list):
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        parsed = json.loads(clean_json_text(str(content)))
-        regions = parsed.get("regions", parsed if isinstance(parsed, list) else [])
-        if not isinstance(regions, list) or not regions:
-            raise ValueError("Qwen response contained no regions")
-        return normalize_regions(regions), "qwen"
+        return json.loads(clean_json_text(str(content))), None
     except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        print(f"Qwen request failed, using offline layout: {exc}")
-        return heuristic_regions(), "offline"
+        return None, str(exc)
+
+
+def segmentation_prompt(hint: str = "") -> str:
+    return f"""你是文档版面分析与语义分割专家。请分析这张草稿截图，给出适合后续裁剪、编辑和分页的语义区域。
+要求：
+1. 这是“裁剪区域”识别，不是给整页画几个大框。每个题号、段落、图表、结构式、公式都要成为独立且紧致的内容块，尽量贴合可见内容，排除周围空白；相邻内容只有在语义上不可分时才合并。
+2. 区域用覆盖内容的最小矩形表示；不要切断公式、化学结构式、图注或生物图片，不要让一个框横跨多个无关对象。
+3. 文字段落、题目、插图、表格、化学结构式、数学公式、生物图片分别识别；小块也必须保留，不得为了减少数量而丢弃。
+4. 同属一个题目/图片编号集合的区域使用相同 group（例如 1、1a、1b 都用 group=\"1\"）。
+5. 坐标为相对于原图的百分比 0-100，x/y 是左上角，w/h 是宽高；只输出 JSON，不要 Markdown。
+6. label 使用简短中文，kind 只能是 text/image/table/chemistry/biology/formula/other。
+7. 过滤页眉、页脚、装饰线和大面积空白；对每个真实内容给出边界，至少保留一个主内容区域。
+8. 图片上叠加了蓝色 10% 坐标网格和刻度，左上角为 (0,0)，右下角为 (100,100)。网格、刻度数字不是内容，必须忽略；输出坐标仍对应没有网格的原始图片。
+用户补充：{hint or '无'}
+输出格式：{{\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""
+
+
+def supervise_regions(model_image: str, proposal: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Have Qwen audit and correct the proposal, bounded to three rounds."""
+
+    current = proposal
+    audit: list[dict[str, Any]] = []
+    max_rounds = max(1, min(3, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "3"))))
+    for round_number in range(1, max_rounds + 1):
+        review_prompt = f"""你是严格的版面分割监督审校 agent。请检查候选区域是否覆盖图片中所有真实内容，并指出漏块、误合并、边界过松/过紧、截断结构式或错误编号集合。
+监督标准：
+1. 每个可独立阅读或编辑的内容都必须有一个区域，小图注、化学键、公式、题号不能丢。
+2. 区域必须紧贴内容，不能把大块空白或无关内容放入同一个框。
+3. 不能切断相互连接的公式、化学结构式、表格、图片和图注。
+4. 坐标使用原图百分比 0-100，网格与刻度不属于内容。
+如果不通过，直接给出修正后的完整 regions 数组，而不是只描述问题。只有确实满足标准时 status 才能是 pass。
+候选 regions：{json.dumps(current, ensure_ascii=False)}
+只输出 JSON：{{\"status\":\"pass\"或\"revise\",\"issues\":[\"...\"],\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\"}}]}}"""
+        parsed, error = qwen_request(model_image, review_prompt)
+        if not parsed:
+            audit.append({"round": round_number, "status": "error", "issues": [error or "监督请求失败"]})
+            return current, audit, False
+        candidate = parsed.get("regions", []) if isinstance(parsed, dict) else []
+        if isinstance(candidate, list) and candidate:
+            current = normalize_regions(candidate)
+        status = str(parsed.get("status", "revise")).lower() if isinstance(parsed, dict) else "revise"
+        issues = parsed.get("issues", []) if isinstance(parsed, dict) else []
+        audit.append({"round": round_number, "status": "pass" if status == "pass" else "revise", "issues": [str(item) for item in issues[:8]]})
+        if status == "pass":
+            return current, audit, True
+    return current, audit, False
+
+
+def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
+    if not api_key:
+        return heuristic_regions(), "offline", {"status": "offline", "rounds": 0, "issues": ["未配置 API key"]}
+
+    model_image = add_coordinate_grid(image_data_url)
+    parsed, error = qwen_request(model_image, segmentation_prompt(hint))
+    if not parsed:
+        print(f"Qwen request failed, using offline layout: {error}")
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [error or "初次分割失败"]}
+    proposal = parsed.get("regions", parsed if isinstance(parsed, list) else [])
+    if not isinstance(proposal, list) or not proposal:
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no regions"]}
+    regions, audit, passed = supervise_regions(model_image, normalize_regions(proposal))
+    return regions, "qwen-supervised", {"status": "pass" if passed else "max-rounds", "rounds": len(audit), "audit": audit}
 
 
 def normalize_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     kinds = {"text", "image", "table", "chemistry", "biology", "formula", "other"}
     normalized: list[dict[str, Any]] = []
-    for index, region in enumerate(regions[:40]):
+    for index, region in enumerate(regions[:80]):
         try:
             bbox = region.get("bbox") if isinstance(region.get("bbox"), list) else None
             raw_x = bbox[0] if bbox and len(bbox) >= 4 else region.get("x", 0)
@@ -320,8 +350,8 @@ class Handler(BaseHTTPRequestHandler):
                 image = str(payload.get("image", ""))
                 if not image.startswith("data:image/"):
                     raise ValueError("需要一个图片 data URL")
-                regions, source = call_qwen(image, str(payload.get("hint", "")))
-                json_response(self, {"regions": regions, "source": source, "model": QWEN_MODEL})
+                regions, source, supervision = call_qwen(image, str(payload.get("hint", "")))
+                json_response(self, {"regions": regions, "source": source, "model": QWEN_MODEL, "supervision": supervision})
                 return
             if self.path == "/api/import-url":
                 result = import_url(str(payload.get("url", "")))

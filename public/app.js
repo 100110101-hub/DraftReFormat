@@ -31,6 +31,7 @@ const state = {
   layoutPaintPaths: [],
   hydrating: false,
   lastAnalyzed: null,
+  lastSupervision: null,
   keepGroups: true,
 };
 
@@ -92,19 +93,21 @@ function renderAssets() {
   const list = $("#assetList");
   if (!state.images.length) { list.innerHTML = '<div class="empty-assets">还没有导入素材</div>'; return; }
   list.innerHTML = state.images.map((image, index) => `<div class="asset-item ${image.id === state.currentId ? "active" : ""}" data-image-id="${image.id}">
-    <img class="asset-thumb" src="${image.src}" alt=""/><div class="asset-info"><div class="asset-name">${escapeHtml(image.name)}</div><div class="asset-meta"><i></i>${image.regions.length ? `${image.regions.length} 个内容块` : "待分析"}<span>·</span>${image.size || "网页素材"}</div></div><span class="asset-index">${String(index + 1).padStart(2, "0")}</span></div>`).join("");
+    <img class="asset-thumb" src="${image.src}" alt=""/><div class="asset-info"><div class="asset-name">${escapeHtml(image.name)}</div><div class="asset-meta"><i></i>${image.regions.length ? `${image.regions.length} 个内容块` : "待分析"}<span>·</span>${image.size || "网页素材"}</div></div><span class="asset-index">${String(index + 1).padStart(2, "0")}</span><button class="asset-delete" data-delete-image="${image.id}" title="删除素材">×</button></div>`).join("");
   $$(".asset-item").forEach((item) => item.addEventListener("click", () => { state.currentId = item.dataset.imageId; state.selectedRegionId = currentImage()?.regions[0]?.id || null; render(); }));
+  $$("[data-delete-image]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); deleteImage(button.dataset.deleteImage); }));
 }
 
 function renderRegions() {
   const layer = $("#regionLayer");
   const items = visualRegions();
-  layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${items.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX || 28}px;top:${region.layoutY || 28}px;width:${region.layoutW || 240}px;height:${region.layoutH || 120}px;border-color:${kindColors[region.kind] || kindColors.other}">
-    <img src="${region.cropSrc || image.src}" alt="${escapeHtml(region.label)}" draggable="false"/><div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span></div>`).join("")}`;
+  layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${items.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX || 28}px;top:${region.layoutY || 28}px;width:${region.layoutW || 240}px;height:${region.layoutH || 120}px;border-color:${kindColors[region.kind] || kindColors.other};z-index:${region.zIndex || 2}">
+    <img src="${region.cropSrc || image.src}" alt="${escapeHtml(region.label)}" draggable="false"/><div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span><button class="tile-delete" data-delete-region="${region.id}" title="删除内容块">×</button></div>`).join("")}`;
   $$(".region-tile").forEach((box) => {
     box.addEventListener("pointerdown", (event) => startRegionPointer(event, box));
     box.addEventListener("click", (event) => { event.stopPropagation(); state.currentId = box.dataset.imageId; state.selectedRegionId = box.dataset.regionId; renderRegions(); renderInspector(); });
   });
+  $$("[data-delete-region]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); deleteRegion(button.closest(".region-tile").dataset.imageId, button.dataset.deleteRegion); }));
   updateOutputCanvasSize(items);
   if (!state.hydrating && items.some(({ region, image }) => !region.cropSrc && (!region.synthetic || !image.previewReady))) hydrateVisualRegions();
 }
@@ -132,7 +135,8 @@ async function hydrateVisualRegions() {
     const items = visualRegions();
     for (const { image, region } of items) {
       if (!image.aspect) image.aspect = await imageAspect(image.src);
-      if (!region.layoutW || !region.layoutH) initializeRegionLayout(region, image);
+      if (region.synthetic) { region.layoutW = 740; region.layoutH = Math.round(740 / (image.aspect || .72)); }
+      else if (!region.layoutW || !region.layoutH) initializeRegionLayout(region, image);
       if (!region.cropSrc && !region.synthetic) region.cropSrc = await cropRegion(image, region);
       if (region.synthetic && !region.cropSrc) { region.cropSrc = image.src; image.previewReady = true; }
     }
@@ -149,7 +153,9 @@ function imageAspect(src) { return new Promise((resolve) => { const img = new Im
 function initializeRegionLayout(region, image) {
   const width = Math.max(150, Math.min(760, 760 * region.w / 100));
   region.layoutW = Math.round(width);
-  region.layoutH = Math.round(Math.max(54, width * region.h / 100 / (image.aspect || .72)));
+  // The crop's aspect is (sourceAspect * w%) / h%; with a tile width of
+  // baseWidth * w%, the matching height is baseWidth * h% / sourceAspect.
+  region.layoutH = Math.round(Math.max(54, 760 * region.h / 100 / (image.aspect || .72)));
   region.layoutX = 28;
   const all = visualRegions().filter(({ region: item }) => item !== region && item.layoutY != null);
   const last = all.reduce((max, item) => Math.max(max, item.region.layoutY + item.region.layoutH), 30);
@@ -217,6 +223,7 @@ function bindEvents() {
   $("#regionGroup").addEventListener("change", (event) => updateSelected("group", event.target.value || "A"));
   $("#newGroupButton").addEventListener("click", () => { const region = selectedRegion(); if (!region) return; pushHistory(); region.group = nextGroup(); render(); });
   ["X", "Y", "W", "H"].forEach((key) => $("#region" + key).addEventListener("change", (event) => updateSelected(key.toLowerCase(), Number(event.target.value))));
+  $("#layerBottom").addEventListener("click", () => changeLayer("bottom")); $("#layerDown").addEventListener("click", () => changeLayer("down")); $("#layerUp").addEventListener("click", () => changeLayer("up")); $("#layerTop").addEventListener("click", () => changeLayer("top"));
   $("#keepGroupsToggle").addEventListener("click", () => { state.keepGroups = !state.keepGroups; $("#keepGroupsToggle").classList.toggle("on", state.keepGroups); });
   $("#marginRange").addEventListener("input", (event) => { $("#marginValue").textContent = `${event.target.value} px`; });
   $$(".tool-button").forEach((button) => button.addEventListener("click", () => setTool(button.dataset.tool)));
@@ -225,6 +232,7 @@ function bindEvents() {
   $("#paintLayer").addEventListener("pointerdown", startBrushStroke);
   document.addEventListener("keydown", (event) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); } if (event.key === "Escape") { setTool("select"); $("#kindMenu").classList.remove("open"); } });
   window.addEventListener("resize", () => { resizePaintCanvas(); drawPaint(); });
+  $("#canvasArea").addEventListener("wheel", (event) => { if (Math.abs(event.deltaY) > 0) { event.preventDefault(); $("#canvasArea").scrollTop += event.deltaY; } }, { passive: false });
 }
 
 function setTool(tool) { state.tool = tool; setToolVisuals(); $("#canvasFrame").classList.toggle("painting", tool === "brush"); }
@@ -273,6 +281,7 @@ function rectFromPoints(a, b) { return { x: Math.min(a.x, b.x), y: Math.min(a.y,
 function clamp(value, min, max) { return Math.max(min, Math.min(max, Number(value) || 0)); }
 function nextGroup() { const groups = new Set((currentImage()?.regions || []).map((region) => region.group)); let n = 1; while (groups.has(String.fromCharCode(64 + n))) n++; return String.fromCharCode(64 + n); }
 function updateSelected(key, value) { const region = selectedRegion(); if (!region) return; pushHistory(); if (["x", "y", "w", "h"].includes(key)) value = clamp(value, key === "w" || key === "h" ? 1 : 0, 100); region[key] = value; if (key === "x") region.w = Math.min(region.w, 100 - value); if (key === "y") region.h = Math.min(region.h, 100 - value); if (["x", "y", "w", "h"].includes(key)) region.cropSrc = null; render(); }
+function changeLayer(direction) { const image = currentImage(); const region = selectedRegion(); if (!image || !region) return showToast("请先选择一个内容块", "warn"); pushHistory(); const regions = image.regions; const index = regions.findIndex((item) => item.id === region.id); if (index < 0) return; const target = direction === "top" ? regions.length - 1 : direction === "bottom" ? 0 : direction === "up" ? Math.min(regions.length - 1, index + 1) : Math.max(0, index - 1); if (target !== index) { regions.splice(index, 1); regions.splice(target, 0, region); } regions.forEach((item, order) => { item.zIndex = order + 2; }); render(); showToast(direction === "top" ? "已置于顶层" : direction === "bottom" ? "已置于底层" : direction === "up" ? "已上移一层" : "已下移一层", "success"); }
 
 async function handleFiles(files) {
   if (!files.length) return;
@@ -306,7 +315,7 @@ async function segmentCurrent() {
     let result;
     if (image.src.startsWith("data:image/")) { const response = await fetch("/api/segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: image.src, hint: "优先保持同一题目编号下的图片、图注和结构式完整" }) }); result = await response.json(); if (!response.ok) throw new Error(result.error || "分析失败"); }
     else { result = { regions: structuredClone(demoRegions), source: "offline" }; }
-    pushHistory(); image.regions = (result.regions || []).map((region, index) => ({ ...region, id: region.id || `region-${Date.now()}-${index}`, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null, userMoved: false })); image.previewReady = false; image.analyzed = true; state.selectedRegionId = image.regions[0]?.id || null; state.lastAnalyzed = "刚刚"; render(); showToast(result.source === "qwen" ? "Qwen 已完成语义分区并裁剪内容块" : "已使用离线演示分区（可继续手动调整）", result.source === "qwen" ? "success" : "warn");
+    pushHistory(); image.regions = (result.regions || []).map((region, index) => ({ ...region, id: region.id || `region-${Date.now()}-${index}`, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null, userMoved: false })); image.previewReady = false; image.analyzed = true; state.lastAnalyzed = "刚刚"; state.lastSupervision = result.supervision || null; state.selectedRegionId = image.regions[0]?.id || null; render(); showToast(result.source === "qwen-supervised" ? `Qwen 分割 + 监督审校完成（${result.supervision?.rounds || 1} 轮）` : "已使用离线演示分区（可继续手动调整）", result.source === "qwen-supervised" ? "success" : "warn");
   } catch (error) { showToast(error.message || "分析失败，请稍后重试", "error"); }
   finally { button.disabled = false; button.innerHTML = "<span>✦</span>分析当前图片"; }
 }
@@ -342,7 +351,9 @@ function drawPaint() {
 }
 
 function clearWhiteouts() { const image = currentImage(); if (!image) return; pushHistory(); state.whiteRects[image.id] = []; state.paintPaths[image.id] = []; state.layoutWhiteRects = []; state.layoutPaintPaths = []; renderRegions(); drawPaint(); showToast("已清除当前画布的涂白", "success"); }
-function deleteSelected() { const image = currentImage(); if (!image || !state.selectedRegionId) return showToast("请先选择一个内容块", "warn"); pushHistory(); image.regions = image.regions.filter((region) => region.id !== state.selectedRegionId); state.selectedRegionId = image.regions[0]?.id || null; render(); showToast("内容块已移除", "success"); }
+function deleteImage(imageId) { const index = state.images.findIndex((image) => image.id === imageId); if (index < 0) return; pushHistory(); state.images.splice(index, 1); delete state.whiteRects[imageId]; delete state.paintPaths[imageId]; if (state.currentId === imageId) { const next = state.images[Math.min(index, state.images.length - 1)]; state.currentId = next?.id || null; state.selectedRegionId = next?.regions[0]?.id || null; } render(); showToast("素材图片已删除", "success"); }
+function deleteRegion(imageId, regionId) { const image = state.images.find((item) => item.id === imageId); if (!image) return; const region = image.regions.find((item) => item.id === regionId); if (!region) return; pushHistory(); image.regions = image.regions.filter((item) => item.id !== regionId); if (state.currentId === imageId && state.selectedRegionId === regionId) state.selectedRegionId = image.regions[0]?.id || null; render(); showToast("内容块已移除", "success"); }
+function deleteSelected() { const image = currentImage(); if (!image || !state.selectedRegionId) return showToast("请先选择一个内容块", "warn"); deleteRegion(image.id, state.selectedRegionId); }
 
 function saveProject() { const images = state.images.map((image) => ({ ...image, regions: image.regions.map(({ cropSrc, ...region }) => region), syntheticRegion: image.syntheticRegion ? (({ cropSrc, ...region }) => region)(image.syntheticRegion) : undefined })); const data = { version: 2, projectName: state.projectName, images, whiteRects: state.whiteRects, paintPaths: state.paintPaths, layoutWhiteRects: state.layoutWhiteRects, layoutPaintPaths: state.layoutPaintPaths, exportedAt: new Date().toISOString() }; const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${state.projectName || "draft-reformat"}.draft.json`; link.click(); URL.revokeObjectURL(link.href); showToast("项目 JSON 已保存", "success"); }
 

@@ -49,10 +49,10 @@ def test_image() -> str:
     return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
-PROMPT = """你是语义裁剪评测员。图片里有标题、说明段落、生物示意图、化学结构式和题目。
-请把每个可独立编辑的内容裁成最小矩形，不能漏掉小图注，不能把无关内容合并。
-只输出 JSON：{"regions":[{"label":"...","kind":"text|image|chemistry|biology|formula|other","x":0,"y":0,"w":10,"h":10,"group":"1"}]}。
-坐标必须是原图百分比 0-100，所有 x/y/w/h 都必须存在且为数字。"""
+PROMPT = server.segmentation_prompt(
+    "Benchmark image containing a title, explanatory text, a biology diagram, "
+    "a chemical structure, and question text. Preserve small captions."
+)
 
 
 def main() -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import socket
@@ -282,22 +283,200 @@ def qwen_request(model_image: str | list[str], prompt: str, model: str | None = 
 
 
 def segmentation_prompt(hint: str = "") -> str:
-    return f"""你是文档版面分析与语义分割专家。请分析这张草稿截图，给出适合后续裁剪、编辑和分页的语义区域。
-要求：
-1. 这是“裁剪区域”识别，不是给整页画几个大框。每个题号、段落、图表、结构式、公式都要成为独立且紧致的内容块，尽量贴合可见内容，排除周围空白；相邻内容只有在语义上不可分时才合并。
-2. 区域边缘必须完整：保留文字笔画、标点、上下标、图注、箭头、键线、边框和图片边缘，不能因为框太紧而截断任何内容；也不要把大块空白放进区域。
-3. 化学反应式、反应机理、反应箭头、反应物/中间体/产物、条件标注和催化剂必须作为同一语义整体，不得按单行、单个化学式或单根箭头拆开。只有彼此独立的不同反应才分开。
-4. 文字段落、题目、插图、表格、化学结构式、数学公式、生物图片分别识别；小块也必须保留，不得为了减少数量而丢弃。
-5. 图片中用方框、圈选、叉划或删除线明确标出的内容，必须单独输出为一个区域，label 标注“待删除框选内容”，并设置 editAction=\"delete\"；框旁的手写修正、补充文字或替换内容必须另设独立区域，不能与被删除内容合并。
-6. 如果一个较大的语义块内部包含需要删除的方框区域，保留外部大块，同时在该区域输出 holes 数组描述需要挖白的内部框；不要把内部删除内容算作外部大块的一部分。
-7. 对三角形、楔形或不规则语义内容，可以用 polygon（0–100 百分比点列）或 triangle 形状表达，并且仍需给出覆盖它的 x/y/w/h；不要为了正方形而扩大到无关内容。没有 polygon 能力时，拆成多个紧邻的语义小块。
-8. 同属一个题目/图片编号集合的区域使用相同 group（例如 1、1a、1b 都用 group=\"1\"）；删除块和对应修正块也应保留可追踪的同组编号。
-9. 坐标为相对于原图的百分比 0-100，x/y 是左上角，w/h 是宽高；只输出 JSON，不要 Markdown。
-10. label 使用简短中文，kind 只能是 text/image/table/chemistry/biology/formula/other。
-11. 过滤页眉、页脚、装饰线和大面积空白；对每个真实内容给出边界，至少保留一个主内容区域。
-12. 原图被放在白色坐标框内，外侧只有蓝色坐标轴、刻度和 0..100 数值，没有内部网格线。内容框左上角对应 (0,0)，右下角对应 (100,100)。坐标轴、刻度和白色扩展区不是内容，必须忽略；输出坐标仍对应没有坐标框的原始图片。
-用户补充：{hint or '无'}
-输出格式：{{\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\",\"editAction\":\"keep|delete\",\"polygon\":[[x,y],[x,y],[x,y]],\"holes\":[{{\"x\":0,\"y\":0,\"w\":5,\"h\":5}}]}}]}}；polygon、holes、editAction 仅在确有需要时输出。"""
+    return """You are a document-layout and semantic-cropping agent. Analyze the supplied draft image and return every independently editable semantic region for downstream cropping and pagination.
+
+SEGMENTATION RULES
+1. Use tight, content-specific regions. Include all visible strokes, punctuation, subscripts/superscripts, captions, borders, arrows, chemical bonds, and image edges. Do not clip content and do not add large blank margins.
+2. Keep a complete chemical reaction, mechanism, arrow sequence, reactants, intermediates, products, conditions, catalysts, and connected annotations together. Never split a chemically or semantically indivisible unit.
+3. Detect text, figures, tables, chemistry, biology, formulas, question parts, and small but meaningful fragments. Do not discard content to reduce region count.
+4. A boxed, circled, crossed-out, or struck-through item is its own deletion region with editAction="delete". A nearby correction or replacement is a separate region. If a large outer region contains an internal deletion box, keep the outer region and represent the deleted area in holes.
+5. Use polygon for triangular, wedge-shaped, or otherwise irregular content when a rectangle would include unrelated material. Always include the enclosing x/y/w/h.
+6. Regions belonging to one logical question or image-number collection share one group. Deletion and correction regions remain traceable through their group.
+7. Ignore coordinate axes, tick marks, numeric labels, decorative lines, headers, footers, page numbers, and blank padding added around the source image.
+
+COORDINATES
+The analysis image has an outer blue 0–100 coordinate frame and no interior grid. Treat that frame as an overlay only. Return x, y, w, h and polygon points as percentages of the original inner image: top-left is (0,0), bottom-right is (100,100), and x+w/y+h must not exceed 100. Round x/y/w/h and polygon points to one decimal place.
+
+USER NOTE
+""" + (hint or "None") + """
+
+OUTPUT SPECIFICATION & SCHEMA
+Return strict, valid JSON only. Do not use markdown code blocks, comments, or explanatory text. The output must be directly parseable by a standard JSON parser.
+
+{
+  "regions": [
+    {
+      "id": "r1",
+      "label": "Reaction Pathway A",
+      "kind": "chemistry",
+      "x": 12.5,
+      "y": 8.2,
+      "w": 34.0,
+      "h": 21.5,
+      "group": "Q1",
+      "description": "Multi-step synthesis with catalyst labels",
+      "editAction": "delete",
+      "polygon": [[12.5,8.2],[46.5,8.2],[42.0,29.7],[15.0,29.7]],
+      "holes": [{"x": 20.0, "y": 15.0, "w": 10.0, "h": 5.0}]
+    }
+  ]
+}
+
+FIELD CONSTRAINTS
+- id is a unique string. label is concise English, at most five words, with no trailing punctuation.
+- kind is exactly one of: ["text", "image", "table", "chemistry", "biology", "formula", "other"].
+- x, y, w, h are numbers in [0,100], with x+w<=100 and y+h<=100.
+- group is a logical grouping string. description is optional.
+- editAction is optional and, when present, is exactly "keep" or "delete". Omit it unless deletion/correction rules explicitly require it; the default is "keep".
+- polygon is optional, contains at least three [x,y] percentage pairs, and should be omitted for a sufficiently rectangular region.
+- holes is optional; each hole is an object with absolute original-image x/y/w/h percentages and should be omitted when there is no internal exclusion.
+- If a field is not applicable, omit it entirely. Never emit null, empty strings, empty arrays, confidence, color, rotation, or any other extra field.
+- The response must start with { and end with }, with zero whitespace outside the JSON. Use double quotes, valid UTF-8, and no trailing commas."""
+
+
+def supervision_prompt(current: list[dict[str, Any]]) -> str:
+    """Build the strict correction prompt used by the supervisor agent."""
+
+    return """You are a production Layout Segmentation QA and Supervisor Agent.
+
+You receive three aligned images:
+1. Original Image: the unmodified source document.
+2. Analysis Overlay: the source with an outer numeric 0–100 coordinate frame and no interior grid.
+3. Candidate Block Contact Map: candidate crops labeled by region ID.
+
+Cross-reference all three images. Return the complete corrected set of regions, not a partial diff. Preserve semantic completeness and content-edge completeness: every visible stroke, punctuation mark, caption, chemical bond, arrow, sub/superscript, table border, image edge, and correction must remain inside an appropriate region. Do not include coordinate axes, tick labels, overlay padding, decorative lines, headers, footers, or blank whitespace.
+
+SUPERVISION RULES
+1. Every independently editable/readable item must be represented. Do not omit small captions, question numbers, formulas, or annotations.
+2. Keep chemical equations, reaction pathways, mechanisms, arrows, reactants, intermediates, products, conditions, catalysts, and connected labels as one semantically complete block. Never split a mechanism or reaction in the middle.
+3. A boxed, circled, crossed-out, or struck-through item must be a separate region with editAction="delete". A nearby correction or replacement must be a separate region. If an outer region contains an internal deletion, keep the outer region and use absolute original-image coordinates in holes.
+4. Use polygon for triangular or irregular content when a rectangle would include unrelated material. The bounding box must still fully contain the content.
+5. Coordinates are percentages of the ORIGINAL image, not the overlay. Enforce 0<=x,y,w,h<=100, x+w<=100, y+h<=100. Round x/y/w/h to exactly two decimal places; polygon points and hole coordinates are also percentages.
+6. If status is pass, issues must be []. If status is revise, issues must briefly identify the remaining defects. In both cases regions must be the complete final region list.
+
+CANDIDATE REGIONS
+""" + json.dumps(current, ensure_ascii=False) + """
+
+OUTPUT SCHEMA & FORMATTING RULES
+You MUST output a single valid JSON object matching the exact structure below. Do not use markdown backticks, code blocks, or conversational text. Output only raw JSON.
+
+{
+  "status": "revise",
+  "issues": ["Boundary clips reaction arrow"],
+  "regions": [
+    {
+      "id": "r1",
+      "label": "Reaction Pathway A",
+      "kind": "chemical",
+      "x": 12.50,
+      "y": 8.20,
+      "w": 34.00,
+      "h": 21.50,
+      "confidence": 0.95,
+      "group": "Q1",
+      "description": "Complete reaction with catalyst labels",
+      "editAction": "keep",
+      "polygon": null,
+      "holes": null
+    }
+  ]
+}
+
+SERIALIZATION CONSTRAINTS
+- status is exactly "pass" or "revise". kind is exactly one of ["text","image","formula","table","diagram","chemical","annotation","other"]. editAction is exactly "keep" or "delete". confidence is a number from 0.00 through 1.00.
+- Candidate values from the first agent use chemistry/biology; serialize these as chemical/diagram in your response so the output always follows the supervisor enum.
+- polygon and holes are conditional: omit them, or use null, when not needed. Do not emit empty arrays for these fields.
+- Every region must include id, label, kind, x, y, w, h, confidence, group, description, and editAction. Use editAction="keep" for ordinary content and "delete" only for explicit deletion/cross-out content.
+- No extra fields. No markdown, comments, explanations, trailing commas, or partial region lists. Escape strings correctly and ensure the result starts with { and ends with }."""
+
+
+def validate_supervision_response(payload: Any) -> list[str]:
+    """Return schema violations for the supervisor's strict JSON contract."""
+
+    if not isinstance(payload, dict):
+        return ["Supervisor output must be one JSON object"]
+    issues: list[str] = []
+    allowed_top = {"status", "issues", "regions"}
+    extra_top = set(payload) - allowed_top
+    if extra_top:
+        issues.append("Unexpected top-level fields: " + ", ".join(sorted(extra_top)))
+    status = payload.get("status")
+    if status not in {"pass", "revise"}:
+        issues.append("status must be pass or revise")
+    raw_issues = payload.get("issues")
+    if not isinstance(raw_issues, list) or any(not isinstance(item, str) for item in raw_issues):
+        issues.append("issues must be an array of strings")
+    elif status == "pass" and raw_issues:
+        issues.append("issues must be empty when status is pass")
+    elif status == "revise" and not raw_issues:
+        issues.append("issues must describe defects when status is revise")
+    regions = payload.get("regions")
+    if not isinstance(regions, list) or not regions:
+        issues.append("regions must be a non-empty complete array")
+        return issues
+
+    required = {"id", "label", "kind", "x", "y", "w", "h", "confidence", "group", "description", "editAction"}
+    allowed = required | {"polygon", "holes"}
+    kinds = {"text", "image", "formula", "table", "diagram", "chemical", "annotation", "other"}
+    for index, region in enumerate(regions[:80]):
+        prefix = f"regions[{index}]"
+        if not isinstance(region, dict):
+            issues.append(f"{prefix} must be an object")
+            continue
+        missing = required - set(region)
+        extras = set(region) - allowed
+        if missing:
+            issues.append(f"{prefix} missing: " + ", ".join(sorted(missing)))
+        if extras:
+            issues.append(f"{prefix} has extra fields: " + ", ".join(sorted(extras)))
+        for key in ("id", "label", "group", "description"):
+            if not isinstance(region.get(key), str) or not region.get(key):
+                issues.append(f"{prefix}.{key} must be a non-empty string")
+        if region.get("kind") not in kinds:
+            issues.append(f"{prefix}.kind is outside the enum")
+        if region.get("editAction") not in {"keep", "delete"}:
+            issues.append(f"{prefix}.editAction is outside the enum")
+        confidence = region.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1:
+            issues.append(f"{prefix}.confidence must be between 0 and 1")
+        coordinates: dict[str, float] = {}
+        for key in ("x", "y", "w", "h"):
+            value = region.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                issues.append(f"{prefix}.{key} must be a finite number")
+                continue
+            coordinates[key] = float(value)
+            if not 0 <= coordinates[key] <= 100:
+                issues.append(f"{prefix}.{key} is outside 0-100")
+        if len(coordinates) == 4 and (coordinates["x"] + coordinates["w"] > 100 or coordinates["y"] + coordinates["h"] > 100):
+            issues.append(f"{prefix} bounding box exceeds the original image")
+        polygon = region.get("polygon")
+        if polygon is not None and (not isinstance(polygon, list) or len(polygon) < 3):
+            issues.append(f"{prefix}.polygon must be null, omitted, or contain at least three points")
+        elif isinstance(polygon, list):
+            for point in polygon:
+                if not isinstance(point, list) or len(point) != 2 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0 <= float(value) <= 100 for value in point):
+                    issues.append(f"{prefix}.polygon contains an invalid point")
+                    break
+        holes = region.get("holes")
+        if holes is not None and not isinstance(holes, list):
+            issues.append(f"{prefix}.holes must be null, omitted, or an array")
+        elif isinstance(holes, list):
+            if not holes:
+                issues.append(f"{prefix}.holes must be null or omitted when empty")
+            for hole in holes:
+                if not isinstance(hole, dict) or set(hole) != {"x", "y", "w", "h"}:
+                    issues.append(f"{prefix}.holes contains an invalid object")
+                    break
+                try:
+                    hx, hy, hw, hh = (float(hole[key]) for key in ("x", "y", "w", "h"))
+                    if not all(math.isfinite(value) and 0 <= value <= 100 for value in (hx, hy, hw, hh)) or hx + hw > 100 or hy + hh > 100:
+                        issues.append(f"{prefix}.holes contains out-of-range coordinates")
+                        break
+                except (TypeError, ValueError):
+                    issues.append(f"{prefix}.holes coordinates must be numbers")
+                    break
+    return issues[:12]
 
 
 def supervise_regions(model_image: str, proposal: list[dict[str, Any]], original_image: str | None = None, candidate_sheet: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
@@ -309,29 +488,29 @@ def supervise_regions(model_image: str, proposal: list[dict[str, Any]], original
     # so a malformed model response cannot create an unbounded bill/loop.
     max_rounds = max(1, min(6, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "5"))))
     for round_number in range(1, max_rounds + 1):
-        review_prompt = f"""你是严格的版面分割监督审校 agent。你会收到三张图：原始图片、带外侧坐标轴的分析图片、候选切割块接触表（接触表左上角文字是候选区域 id）。请同时查看三张图，逐一核对候选切割块是否来自正确位置，并检查候选区域是否覆盖图片中所有真实内容。
-监督标准：
-1. 每个可独立阅读或编辑的内容都必须有一个区域，小图注、化学键、公式、题号、反应箭头不能丢。
-2. 逐像素检查区域边缘：不能截断笔画、上下标、键线、箭头、图注或图片边缘，也不能吞入大块空白。
-3. 化学反应式和机理必须完整保留反应物、条件、箭头、中间体、产物及相邻说明，不能被拆成互不完整的碎块。
-4. 方框、圈选、叉划或删除线标记的内容必须单独成为 editAction=\"delete\" 区域；旁边的修正必须另成区域；若外部大块包含删除框，外部区域必须用 holes 挖掉内部区域。
-5. 三角形/不规则内容可用 polygon 表示，且 bbox 必须覆盖完整内容；polygon 边缘同样不能截断语义内容。
-6. 坐标使用原图百分比 0-100，外侧坐标轴、刻度和白色扩展区不属于内容。
-如果不通过，直接给出修正后的完整 regions 数组，而不是只描述问题。只有确实满足标准时 status 才能是 pass。
-候选 regions：{json.dumps(current, ensure_ascii=False)}
-只输出 JSON：{{\"status\":\"pass\"或\"revise\",\"issues\":[\"...\"],\"regions\":[{{\"id\":\"r1\",\"label\":\"...\",\"kind\":\"text\",\"x\":0,\"y\":0,\"w\":20,\"h\":10,\"confidence\":0.92,\"group\":\"1\",\"description\":\"...\",\"editAction\":\"keep|delete\",\"polygon\":[[x,y],[x,y],[x,y]],\"holes\":[{{\"x\":0,\"y\":0,\"w\":5,\"h\":5}}]}}]}}"""
+        review_prompt = supervision_prompt(current)
         review_images = [image for image in (original_image, model_image, candidate_sheet) if image] if original_image else model_image
         parsed, error = qwen_request(review_images, review_prompt)
         if not parsed:
             audit.append({"round": round_number, "status": "error", "issues": [error or "监督请求失败"]})
             return current, audit, False
-        candidate = parsed.get("regions", []) if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
+        schema_issues = validate_supervision_response(parsed)
+        if schema_issues:
+            audit.append({"round": round_number, "status": "revise", "issues": schema_issues[:8]})
+            continue
+        candidate = parsed.get("regions", []) if isinstance(parsed, dict) else []
         if isinstance(candidate, list) and candidate:
-            current = normalize_regions(candidate)
+            corrected = normalize_regions(candidate, precision=2)
+            if corrected:
+                current = corrected
         status = str(parsed.get("status", "revise")).lower() if isinstance(parsed, dict) else "revise"
         issues = parsed.get("issues", []) if isinstance(parsed, dict) else []
-        audit.append({"round": round_number, "status": "pass" if status == "pass" else "revise", "issues": [str(item) for item in issues[:8]]})
-        if status == "pass":
+        if not isinstance(issues, list):
+            issues = [str(issues)] if issues else []
+        clean_issues = [str(item) for item in issues[:8]]
+        passed = status == "pass" and not clean_issues and bool(current)
+        audit.append({"round": round_number, "status": "pass" if passed else "revise", "issues": clean_issues})
+        if passed:
             return current, audit, True
     return current, audit, False
 
@@ -348,10 +527,18 @@ def prepare_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, An
     if not parsed:
         print(f"Qwen request failed, using offline layout: {error}")
         return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [error or "初次分割失败"]}, model_image
-    proposal = parsed.get("regions", []) if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
+    proposal = parsed.get("regions", []) if isinstance(parsed, dict) else []
     if not isinstance(proposal, list) or not proposal:
         return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no regions"]}, model_image
-    return normalize_regions(proposal), "qwen-initial", {"status": "pending", "rounds": 0, "audit": []}, model_image
+    normalized = normalize_regions(
+        proposal,
+        precision=1,
+        include_confidence=False,
+        include_keep_action=False,
+    )
+    if not normalized:
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no valid regions"]}, model_image
+    return normalized, "qwen-initial", {"status": "pending", "rounds": 0, "audit": []}, model_image
 
 
 def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
@@ -407,7 +594,7 @@ def get_supervision_job(job_id: str) -> dict[str, Any] | None:
         return dict(job) if job else None
 
 
-def normalize_points(raw: Any) -> list[list[float]]:
+def normalize_points(raw: Any, precision: int = 2) -> list[list[float]]:
     """Normalize optional polygon points expressed as [x,y] or {x,y}."""
 
     points: list[list[float]] = []
@@ -421,13 +608,16 @@ def normalize_points(raw: Any) -> list[list[float]]:
                 px, py = point[0], point[1]
             else:
                 continue
-            points.append([round(max(0, min(100, float(px))), 2), round(max(0, min(100, float(py))), 2)])
+            points.append([
+                round(max(0, min(100, float(px))), precision),
+                round(max(0, min(100, float(py))), precision),
+            ])
         except (TypeError, ValueError):
             continue
     return points if len(points) >= 3 else []
 
 
-def normalize_holes(raw: Any) -> list[dict[str, Any]]:
+def normalize_holes(raw: Any, precision: int = 2) -> list[dict[str, Any]]:
     holes: list[dict[str, Any]] = []
     if not isinstance(raw, list):
         return holes
@@ -439,56 +629,106 @@ def normalize_holes(raw: Any) -> list[dict[str, Any]]:
                 w = max(0, min(100 - x, float(hole["w"])))
                 h = max(0, min(100 - y, float(hole["h"])))
                 if w and h:
-                    holes.append({"x": round(x, 2), "y": round(y, 2), "w": round(w, 2), "h": round(h, 2)})
+                    holes.append({
+                        "x": round(x, precision),
+                        "y": round(y, precision),
+                        "w": round(w, precision),
+                        "h": round(h, precision),
+                    })
             except (TypeError, ValueError):
                 continue
-        else:
-            polygon = normalize_points(hole)
-            if polygon:
-                holes.append({"polygon": polygon})
     return holes
 
 
-def normalize_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    kinds = {"text", "image", "table", "chemistry", "biology", "formula", "other"}
+def normalize_regions(
+    regions: list[dict[str, Any]],
+    precision: int = 2,
+    include_confidence: bool = True,
+    include_keep_action: bool = True,
+) -> list[dict[str, Any]]:
+    """Validate model JSON and convert both agent schemas to editor regions.
+
+    The segmentation agent uses chemistry/biology while the supervisor uses
+    chemical/diagram/annotation. Both documented enums are preserved so the
+    API output continues to match the producing agent's schema. Unknown keys
+    are intentionally discarded.
+    """
+
+    kind_map = {
+        "text": "text",
+        "image": "image",
+        "table": "table",
+        "chemistry": "chemistry",
+        "chemical": "chemical",
+        "biology": "biology",
+        "diagram": "diagram",
+        "annotation": "annotation",
+        "formula": "formula",
+        "other": "other",
+    }
     normalized: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
     for index, region in enumerate(regions[:80]):
+        if not isinstance(region, dict):
+            continue
         try:
             bbox = region.get("bbox") if isinstance(region.get("bbox"), list) else None
-            raw_x = bbox[0] if bbox and len(bbox) >= 4 else region.get("x", 0)
-            raw_y = bbox[1] if bbox and len(bbox) >= 4 else region.get("y", 0)
-            raw_w = (bbox[2] - bbox[0]) if bbox and len(bbox) >= 4 else region.get("w", 10)
-            raw_h = (bbox[3] - bbox[1]) if bbox and len(bbox) >= 4 else region.get("h", 10)
+            if bbox and len(bbox) >= 4:
+                raw_x, raw_y = bbox[0], bbox[1]
+                raw_w, raw_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            elif all(key in region for key in ("x", "y", "w", "h")):
+                raw_x, raw_y, raw_w, raw_h = (region[key] for key in ("x", "y", "w", "h"))
+            else:
+                continue
             scale = 0.1 if max(abs(float(raw_x or 0)), abs(float(raw_y or 0)), abs(float(raw_w or 0)), abs(float(raw_h or 0))) > 100 else 1
             x = max(0, min(100, float(raw_x) * scale))
             y = max(0, min(100, float(raw_y) * scale))
-            w = max(1, min(100 - x, float(raw_w) * scale))
-            h = max(1, min(100 - y, float(raw_h) * scale))
+            w = min(100 - x, float(raw_w) * scale)
+            h = min(100 - y, float(raw_h) * scale)
+            if w <= 0 or h <= 0:
+                continue
+            raw_kind = str(region.get("kind") or "other").strip().lower()
+            region_id = str(region.get("id") or f"r{index + 1}").strip() or f"r{index + 1}"
+            if region_id in used_ids:
+                suffix = 2
+                base_id = region_id
+                while f"{base_id}_{suffix}" in used_ids:
+                    suffix += 1
+                region_id = f"{base_id}_{suffix}"
+            used_ids.add(region_id)
+            label = str(region.get("label") or "Semantic Region").strip().rstrip(".,;:!?")
+            label = " ".join(label.split()[:5])[:80] or "Semantic Region"
             item = {
-                "id": str(region.get("id") or f"region-{index + 1}"),
-                "label": str(region.get("label") or "语义区域")[:40],
-                "kind": str(region.get("kind") or "other") if str(region.get("kind") or "other") in kinds else "other",
-                "x": round(x, 2),
-                "y": round(y, 2),
-                "w": round(w, 2),
-                "h": round(h, 2),
-                "confidence": round(max(0, min(1, float(region.get("confidence", 0.6)))), 2),
-                "group": str(region.get("group") or str(index + 1)),
-                "description": str(region.get("description") or "语义内容区域")[:120],
+                "id": region_id,
+                "label": label,
+                "kind": kind_map.get(raw_kind, "other"),
+                "x": round(x, precision),
+                "y": round(y, precision),
+                "w": round(w, precision),
+                "h": round(h, precision),
+                "group": str(region.get("group") or f"Q{index + 1}").strip() or f"Q{index + 1}",
             }
-            action = str(region.get("editAction") or "keep").lower()
-            item["editAction"] = action if action in {"keep", "delete"} else "keep"
-            polygon = normalize_points(region.get("polygon") or region.get("triangle"))
+            if region.get("description") not in (None, ""):
+                item["description"] = str(region["description"])[:120]
+            if include_confidence and region.get("confidence") is not None:
+                item["confidence"] = round(max(0, min(1, float(region["confidence"]))), 2)
+            action = str(region.get("editAction") or "").strip().lower()
+            if action == "delete" or (include_keep_action and action == "keep"):
+                item["editAction"] = action
+            polygon = normalize_points(region.get("polygon"), precision)
             if polygon:
-                item["polygon"] = polygon
-                item["shape"] = "triangle" if len(polygon) == 3 else "polygon"
-            holes = normalize_holes(region.get("holes"))
+                max_x, max_y = x + w, y + h
+                item["polygon"] = [
+                    [round(max(x, min(max_x, px)), precision), round(max(y, min(max_y, py)), precision)]
+                    for px, py in polygon
+                ]
+            holes = normalize_holes(region.get("holes"), precision)
             if holes:
                 item["holes"] = holes
             normalized.append(item)
         except (TypeError, ValueError):
             continue
-    return normalized or heuristic_regions()
+    return normalized
 
 
 def import_url(url: str) -> dict[str, Any]:

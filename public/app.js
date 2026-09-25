@@ -4,10 +4,11 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 
 const kindNames = {
   text: "文字段落", image: "图片 / 插图", table: "表格", chemistry: "化学结构式",
-  biology: "生物图片", formula: "数学公式", other: "其他内容"
+  biology: "生物图片", formula: "数学公式", diagram: "图示 / 示意图",
+  chemical: "化学结构式", annotation: "批注 / 修正", other: "其他内容"
 };
-const kindShort = { text: "TEXT", image: "IMAGE", table: "TABLE", chemistry: "CHEM", biology: "BIO", formula: "FORMULA", other: "BLOCK" };
-const kindColors = { text: "#ac8cff", image: "#61d7d4", table: "#63d7aa", chemistry: "#eec77a", biology: "#61d7d4", formula: "#eec77a", other: "#9aa3b4" };
+const kindShort = { text: "TEXT", image: "IMAGE", table: "TABLE", chemistry: "CHEM", biology: "BIO", formula: "FORMULA", diagram: "DIAGRAM", chemical: "CHEM", annotation: "NOTE", other: "BLOCK" };
+const kindColors = { text: "#ac8cff", image: "#61d7d4", table: "#63d7aa", chemistry: "#eec77a", biology: "#61d7d4", formula: "#eec77a", diagram: "#61d7d4", chemical: "#eec77a", annotation: "#ac8cff", other: "#9aa3b4" };
 const demoRegions = [
   { id: "demo-1", label: "章节标题", kind: "text", x: 8, y: 6, w: 84, h: 12, confidence: .96, group: "A", description: "主标题与题目范围" },
   { id: "demo-2", label: "题干与说明", kind: "text", x: 8, y: 22, w: 84, h: 21, confidence: .91, group: "A", description: "连续正文段落，建议保持完整" },
@@ -206,7 +207,7 @@ function renderInspector() {
   $("#regionGroup").value = region.group || "";
   $("#groupBadge").textContent = region.group || "—";
   $("#regionX").value = region.x; $("#regionY").value = region.y; $("#regionW").value = region.w; $("#regionH").value = region.h;
-  const confidence = Math.round((region.confidence || .6) * 100); $("#confidenceValue").textContent = `${confidence}%`; $("#confidenceBar").style.width = `${confidence}%`; $("#regionDescription").textContent = region.description || "语义内容区域";
+  const confidence = Math.round((region.confidence ?? .6) * 100); $("#confidenceValue").textContent = `${confidence}%`; $("#confidenceBar").style.width = `${confidence}%`; $("#regionDescription").textContent = region.description || "语义内容区域";
 }
 
 function bindEvents() {

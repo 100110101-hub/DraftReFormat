@@ -24,9 +24,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
 except ImportError:  # Pillow is optional for the offline demo, required for coordinate hints.
-    Image = ImageDraw = ImageFont = None
+    Image = ImageDraw = ImageFont = ImageOps = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -194,45 +194,162 @@ def add_coordinate_grid(image_data_url: str) -> str:
         return image_data_url
 
 
-def make_candidate_sheet(image_data_url: str, proposal: list[dict[str, Any]]) -> str | None:
-    """Create a compact contact sheet of candidate crops for the supervisor."""
+def _overlay_font(size: int) -> Any:
+    """Load a legible font without making one OS font a hard dependency."""
 
-    if Image is None:
-        return None
+    for name in ("DejaVuSans.ttf", "arial.ttf"):
+        try:
+            return ImageFont.truetype(name, size=size)
+        except (OSError, AttributeError):
+            continue
     try:
-        _, encoded = image_data_url.split(",", 1)
-        source = Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
-        cards: list[tuple[str, Image.Image]] = []
-        for region in proposal[:40]:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _draw_candidate_boundaries(
+    canvas: Any,
+    proposal: list[dict[str, Any]],
+    content_box: tuple[int, int, int, int],
+) -> None:
+    """Draw bboxes, exact polygons, holes, and IDs over one source image."""
+
+    draw = ImageDraw.Draw(canvas)
+    left, top, right, bottom = content_box
+    width, height = max(1, right - left), max(1, bottom - top)
+    line_width = max(3, round(max(width, height) / 600))
+    thin_width = max(2, line_width // 2)
+    font = _overlay_font(max(13, line_width * 4))
+
+    def point(px: Any, py: Any) -> tuple[int, int]:
+        return (
+            left + round(width * max(0, min(100, float(px))) / 100),
+            top + round(height * max(0, min(100, float(py))) / 100),
+        )
+
+    for index, region in enumerate(proposal[:80]):
+        try:
             x = max(0, min(100, float(region.get("x", 0))))
             y = max(0, min(100, float(region.get("y", 0))))
-            w = max(1, min(100 - x, float(region.get("w", 1))))
-            h = max(1, min(100 - y, float(region.get("h", 1))))
-            left = round(source.width * x / 100)
-            top = round(source.height * y / 100)
-            right = max(left + 1, round(source.width * (x + w) / 100))
-            bottom = max(top + 1, round(source.height * (y + h) / 100))
-            crop = source.crop((left, top, right, bottom))
-            crop.thumbnail((280, 180), Image.Resampling.LANCZOS)
-            cards.append((str(region.get("id") or len(cards) + 1), crop.copy()))
-        if not cards:
-            return None
-        columns = 3
-        card_width, card_height = 320, 220
-        sheet = Image.new("RGB", (columns * card_width, ((len(cards) + columns - 1) // columns) * card_height), "white")
-        draw = ImageDraw.Draw(sheet)
-        for index, (label, crop) in enumerate(cards):
-            x0 = (index % columns) * card_width
-            y0 = (index // columns) * card_height
-            draw.rectangle((x0, y0, x0 + card_width - 1, y0 + card_height - 1), outline=(190, 198, 210), width=2)
-            draw.text((x0 + 8, y0 + 6), label, fill=(30, 80, 130))
-            sheet.paste(crop, (x0 + (card_width - crop.width) // 2, y0 + 30))
-        output = BytesIO()
-        sheet.save(output, format="JPEG", quality=88, optimize=True)
-        return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+            w = max(0, min(100 - x, float(region.get("w", 0))))
+            h = max(0, min(100 - y, float(region.get("h", 0))))
+            if not w or not h:
+                continue
+            x0, y0 = point(x, y)
+            x1, y1 = point(x + w, y + h)
+            deleting = str(region.get("editAction") or "").lower() == "delete"
+            bbox_color = (224, 45, 55) if deleting else (20, 105, 235)
+            polygon_color = (224, 45, 55) if deleting else (155, 45, 220)
+            raw_polygon = region.get("polygon")
+            polygon: list[tuple[int, int]] = []
+            if isinstance(raw_polygon, list):
+                for raw_point in raw_polygon:
+                    if isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2:
+                        polygon.append(point(raw_point[0], raw_point[1]))
+            if len(polygon) >= 3:
+                # Show the numeric bbox as a thin reference, then emphasize the
+                # true non-rectangular cutting boundary.
+                draw.rectangle((x0, y0, x1, y1), outline=bbox_color, width=thin_width)
+                draw.line(polygon + [polygon[0]], fill=polygon_color, width=line_width, joint="curve")
+            else:
+                polygon = []
+                draw.rectangle((x0, y0, x1, y1), outline=bbox_color, width=line_width)
+
+            for hole in region.get("holes") or []:
+                if not isinstance(hole, dict) or not all(key in hole for key in ("x", "y", "w", "h")):
+                    continue
+                hx0, hy0 = point(hole["x"], hole["y"])
+                hx1, hy1 = point(float(hole["x"]) + float(hole["w"]), float(hole["y"]) + float(hole["h"]))
+                draw.rectangle((hx0, hy0, hx1, hy1), outline=(245, 126, 24), width=line_width)
+
+            label = str(region.get("id") or f"r{index + 1}")
+            group = str(region.get("group") or "")
+            suffix = " DELETE" if deleting else " POLY" if polygon else ""
+            tag = f"{label}{' / ' + group if group else ''}{suffix}"
+            text_box = draw.textbbox((0, 0), tag, font=font, stroke_width=1)
+            tag_width = text_box[2] - text_box[0] + 10
+            tag_height = text_box[3] - text_box[1] + 8
+            tag_x = max(left, min(right - tag_width, x0))
+            tag_y = y0 - tag_height if y0 - tag_height >= top else min(bottom - tag_height, y0 + line_width)
+            draw.rectangle((tag_x, tag_y, tag_x + tag_width, tag_y + tag_height), fill=polygon_color if polygon else bbox_color)
+            draw.text((tag_x + 5, tag_y + 3), tag, font=font, fill="white", stroke_width=1, stroke_fill=(30, 30, 30))
+        except (TypeError, ValueError):
+            continue
+
+
+def _coordinate_review_canvas(source: Any) -> tuple[Any, tuple[int, int, int, int]]:
+    """Place an enlarged image inside external 0–100 coordinate axes."""
+
+    width, height = source.size
+    axis_font = _overlay_font(max(16, round(max(width, height) / 110)))
+    pad_left = max(92, round(width * 0.045))
+    pad_top = max(70, round(height * 0.04))
+    pad_right = max(42, round(width * 0.02))
+    pad_bottom = max(50, round(height * 0.025))
+    canvas = Image.new("RGB", (width + pad_left + pad_right, height + pad_top + pad_bottom), "white")
+    canvas.paste(source, (pad_left, pad_top))
+    draw = ImageDraw.Draw(canvas)
+    x0, y0, x1, y1 = pad_left, pad_top, pad_left + width, pad_top + height
+    axis_color = (42, 114, 181)
+    axis_width = max(3, round(max(width, height) / 900))
+    draw.rectangle((x0, y0, x1, y1), outline=axis_color, width=axis_width)
+    axis_y = y0 - max(24, pad_top // 3)
+    axis_x = x0 - max(28, pad_left // 3)
+    draw.line((x0, axis_y, x1, axis_y), fill=axis_color, width=axis_width)
+    draw.line((axis_x, y0, axis_x, y1), fill=axis_color, width=axis_width)
+    for index in range(11):
+        px = x0 + round(width * index / 10)
+        py = y0 + round(height * index / 10)
+        label = str(index * 10)
+        draw.line((px, axis_y - 6, px, axis_y + 6), fill=axis_color, width=axis_width)
+        label_box = draw.textbbox((0, 0), label, font=axis_font)
+        label_width = label_box[2] - label_box[0]
+        draw.text((px - label_width / 2, max(1, axis_y - pad_top // 2)), label, font=axis_font, fill=(23, 78, 128))
+        draw.line((axis_x - 6, py, axis_x + 6, py), fill=axis_color, width=axis_width)
+        draw.text((max(1, axis_x - pad_left * 0.55), py - 8), label, font=axis_font, fill=(23, 78, 128))
+    draw.text((x1 + 8, axis_y - 10), "X", font=axis_font, fill=(23, 78, 128))
+    draw.text((axis_x - 8, y1 + 8), "Y", font=axis_font, fill=(23, 78, 128))
+    return canvas, (x0, y0, x1, y1)
+
+
+def _encode_review_image(image: Any) -> str:
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=95, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def make_supervision_images(image_data_url: str, proposal: list[dict[str, Any]]) -> list[str]:
+    """Create exactly two framed candidate views for the supervisor.
+
+    Image 1 retains a compact source view with all candidate boundaries.
+    Image 2 enlarges the source and adds external numeric coordinates while
+    repeating the same rectangle/polygon/hole overlays.
+    """
+
+    if Image is None:
+        raise RuntimeError("Pillow is required to draw supervision boundaries")
+    try:
+        _, encoded = image_data_url.split(",", 1)
+        source = Image.open(BytesIO(base64.b64decode(encoded)))
+        source = ImageOps.exif_transpose(source).convert("RGB") if ImageOps else source.convert("RGB")
+        max_dimension = max(1, source.width, source.height)
+        compact_scale = min(1.0, 1800 / max_dimension)
+        enlarged_scale = min(2.0, 3200 / max_dimension)
+
+        def resized(scale: float) -> Any:
+            target = (max(1, round(source.width * scale)), max(1, round(source.height * scale)))
+            return source.copy() if target == source.size else source.resize(target, Image.Resampling.LANCZOS)
+
+        compact = resized(compact_scale)
+        _draw_candidate_boundaries(compact, proposal, (0, 0, compact.width, compact.height))
+
+        enlarged = resized(enlarged_scale)
+        coordinate_canvas, content_box = _coordinate_review_canvas(enlarged)
+        _draw_candidate_boundaries(coordinate_canvas, proposal, content_box)
+        return [_encode_review_image(compact), _encode_review_image(coordinate_canvas)]
     except Exception as exc:
-        print(f"Candidate sheet skipped: {exc}")
-        return None
+        raise RuntimeError(f"Unable to create supervision boundary images: {exc}") from exc
 
 
 def qwen_request(model_image: str | list[str], prompt: str, model: str | None = None) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
@@ -339,19 +456,20 @@ def supervision_prompt(current: list[dict[str, Any]]) -> str:
 
     return """You are a production Layout Segmentation QA and Supervisor Agent.
 
-You receive three aligned images:
-1. Original Image: the unmodified source document.
-2. Analysis Overlay: the source with an outer numeric 0–100 coordinate frame and no interior grid.
-3. Candidate Block Contact Map: candidate crops labeled by region ID.
+You receive exactly two aligned images containing the same candidate regions:
+1. Candidate Boundary Overlay: a compact view of the original image with every candidate rectangle or exact polygon drawn over its source content.
+2. Enlarged Coordinate Boundary Overlay: a higher-resolution enlarged view with the same candidate boundaries plus external numeric 0–100 X/Y axes. There are no interior grid lines.
 
-Cross-reference all three images. Return the complete corrected set of regions, not a partial diff. Preserve semantic completeness and content-edge completeness: every visible stroke, punctuation mark, caption, chemical bond, arrow, sub/superscript, table border, image edge, and correction must remain inside an appropriate region. Do not include coordinate axes, tick labels, overlay padding, decorative lines, headers, footers, or blank whitespace.
+Each boundary is labeled with its region ID and group. A blue boundary is a rectangular keep candidate. A purple boundary is an exact polygon candidate; its thin blue rectangle is only the required bounding box. A red boundary is a deletion candidate. Orange rectangles are internal holes/cutouts. All colored lines, labels, axes, and outer padding are review overlays, not document content.
+
+Cross-reference both images. Return the complete corrected set of regions, not a partial diff. Preserve semantic completeness and content-edge completeness: every visible stroke, punctuation mark, caption, chemical bond, arrow, sub/superscript, table border, image edge, and correction must remain inside an appropriate region. Do not include overlay lines, IDs, coordinate axes, tick labels, outer padding, decorative lines, headers, footers, or blank whitespace as content.
 
 SUPERVISION RULES
 1. Every independently editable/readable item must be represented. Do not omit small captions, question numbers, formulas, or annotations.
 2. Keep chemical equations, reaction pathways, mechanisms, arrows, reactants, intermediates, products, conditions, catalysts, and connected labels as one semantically complete block. Never split a mechanism or reaction in the middle.
 3. A boxed, circled, crossed-out, or struck-through item must be a separate region with editAction="delete". A nearby correction or replacement must be a separate region. If an outer region contains an internal deletion, keep the outer region and use absolute original-image coordinates in holes.
 4. Use polygon for triangular or irregular content when a rectangle would include unrelated material. The bounding box must still fully contain the content.
-5. Coordinates are percentages of the ORIGINAL image, not the overlay. Enforce 0<=x,y,w,h<=100, x+w<=100, y+h<=100. Round x/y/w/h to exactly two decimal places; polygon points and hole coordinates are also percentages.
+5. Read precise values from the enlarged coordinate overlay, but calculate every coordinate against the original inner image, not the enlarged canvas or its outer axes. Enforce 0<=x,y,w,h<=100, x+w<=100, y+h<=100. Round x/y/w/h to exactly two decimal places; polygon points and hole coordinates are also percentages.
 6. If status is pass, issues must be []. If status is revise, issues must briefly identify the remaining defects. In both cases regions must be the complete final region list.
 
 CANDIDATE REGIONS
@@ -479,7 +597,7 @@ def validate_supervision_response(payload: Any) -> list[str]:
     return issues[:12]
 
 
-def supervise_regions(model_image: str, proposal: list[dict[str, Any]], original_image: str | None = None, candidate_sheet: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+def supervise_regions(original_image: str, proposal: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
     """Have Qwen audit and correct the proposal, bounded to a safe number of rounds."""
 
     current = proposal
@@ -489,7 +607,11 @@ def supervise_regions(model_image: str, proposal: list[dict[str, Any]], original
     max_rounds = max(1, min(6, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "5"))))
     for round_number in range(1, max_rounds + 1):
         review_prompt = supervision_prompt(current)
-        review_images = [image for image in (original_image, model_image, candidate_sheet) if image] if original_image else model_image
+        try:
+            review_images = make_supervision_images(original_image, current)
+        except RuntimeError as exc:
+            audit.append({"round": round_number, "status": "error", "issues": [str(exc)]})
+            return current, audit, False
         parsed, error = qwen_request(review_images, review_prompt)
         if not parsed:
             audit.append({"round": round_number, "status": "error", "issues": [error or "监督请求失败"]})
@@ -547,11 +669,11 @@ def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]]
     regions, source, supervision, model_image = prepare_qwen(image_data_url, hint)
     if source != "qwen-initial" or not model_image:
         return regions, source, supervision
-    regions, audit, passed = supervise_regions(model_image, regions, image_data_url, make_candidate_sheet(image_data_url, regions))
+    regions, audit, passed = supervise_regions(image_data_url, regions)
     return regions, "qwen-supervised", {"status": "pass" if passed else "max-rounds", "rounds": len(audit), "audit": audit}
 
 
-def start_supervision_job(model_image: str, proposal: list[dict[str, Any]], original_image: str) -> str:
+def start_supervision_job(proposal: list[dict[str, Any]], original_image: str) -> str:
     """Continue supervision in the background so multiple jobs can run concurrently."""
 
     job_id = f"segment-{uuid.uuid4().hex}"
@@ -564,14 +686,14 @@ def start_supervision_job(model_image: str, proposal: list[dict[str, Any]], orig
             "regions": normalize_regions(proposal),
             "supervision": {"status": "pending", "rounds": 0, "audit": []},
         }
-    thread = threading.Thread(target=_run_supervision_job, args=(job_id, model_image, proposal, original_image), daemon=True)
+    thread = threading.Thread(target=_run_supervision_job, args=(job_id, proposal, original_image), daemon=True)
     thread.start()
     return job_id
 
 
-def _run_supervision_job(job_id: str, model_image: str, proposal: list[dict[str, Any]], original_image: str) -> None:
+def _run_supervision_job(job_id: str, proposal: list[dict[str, Any]], original_image: str) -> None:
     try:
-        regions, audit, passed = supervise_regions(model_image, proposal, original_image, make_candidate_sheet(original_image, proposal))
+        regions, audit, passed = supervise_regions(original_image, proposal)
         status = "pass" if passed else "max-rounds"
         if audit and audit[-1].get("status") == "error":
             status = "error"
@@ -798,7 +920,7 @@ class Handler(BaseHTTPRequestHandler):
                 regions, source, supervision, model_image = prepare_qwen(image, str(payload.get("hint", "")))
                 response: dict[str, Any] = {"regions": regions, "source": source, "model": QWEN_MODEL, "supervision": supervision}
                 if source == "qwen-initial" and model_image:
-                    job_id = start_supervision_job(model_image, regions, image)
+                    job_id = start_supervision_job(regions, image)
                     response["jobId"] = job_id
                     response["supervision"] = {**supervision, "jobId": job_id}
                 json_response(self, response)

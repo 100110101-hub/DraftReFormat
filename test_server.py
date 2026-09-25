@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import unittest
+from io import BytesIO
 from unittest.mock import patch
 
 import server
@@ -33,6 +35,39 @@ def valid_supervisor_payload() -> dict:
 
 
 class StructuredOutputTests(unittest.TestCase):
+    @unittest.skipIf(server.Image is None, "Pillow is required")
+    def test_supervision_uses_two_boundary_overlay_images(self) -> None:
+        source = server.Image.new("RGB", (400, 300), "white")
+        encoded = BytesIO()
+        source.save(encoded, format="PNG")
+        image_data_url = "data:image/png;base64," + base64.b64encode(encoded.getvalue()).decode("ascii")
+        regions = [
+            {"id": "rect", "label": "Text Block", "kind": "text", "x": 10, "y": 10, "w": 25, "h": 20, "group": "Q1"},
+            {
+                "id": "poly",
+                "label": "Triangle Diagram",
+                "kind": "diagram",
+                "x": 50,
+                "y": 20,
+                "w": 30,
+                "h": 40,
+                "group": "Q2",
+                "polygon": [[50, 20], [80, 20], [65, 60]],
+                "holes": [{"x": 62, "y": 30, "w": 5, "h": 5}],
+            },
+        ]
+        images = server.make_supervision_images(image_data_url, regions)
+        self.assertEqual(len(images), 2)
+        rendered = [server.Image.open(BytesIO(base64.b64decode(item.split(",", 1)[1]))).convert("RGB") for item in images]
+        self.assertEqual(rendered[0].size, source.size)
+        self.assertGreater(rendered[1].width, rendered[0].width)
+        self.assertGreater(rendered[1].height, rendered[0].height)
+        self.assertNotEqual(rendered[0].getpixel((40, 30)), (255, 255, 255))
+        self.assertNotEqual(rendered[0].getpixel((200, 60)), (255, 255, 255))
+        prompt = server.supervision_prompt(regions)
+        self.assertIn("exactly two aligned images", prompt)
+        self.assertNotIn("three aligned images", prompt)
+
     def test_initial_output_omits_confidence_and_default_keep(self) -> None:
         regions = server.normalize_regions(
             [
@@ -93,11 +128,21 @@ class StructuredOutputTests(unittest.TestCase):
                 "group": "Q1",
             }
         ]
-        with patch("server.qwen_request", side_effect=lambda *args, **kwargs: next(responses)):
-            regions, audit, passed = server.supervise_regions("data:image/png;base64,AA==", initial)
+        sent_images: list[list[str]] = []
+
+        def fake_request(images: list[str], *args, **kwargs):
+            sent_images.append(images)
+            return next(responses)
+
+        with (
+            patch("server.make_supervision_images", return_value=["overlay-1", "overlay-2"]),
+            patch("server.qwen_request", side_effect=fake_request),
+        ):
+            regions, audit, passed = server.supervise_regions("source-image", initial)
         self.assertTrue(passed)
         self.assertEqual([item["status"] for item in audit], ["revise", "pass"])
         self.assertEqual(regions[0]["kind"], "chemical")
+        self.assertEqual(sent_images, [["overlay-1", "overlay-2"], ["overlay-1", "overlay-2"]])
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@
 
 /* The editor surface is a real, white, continuous canvas. Content blocks are
    cropped images, not translucent selection rectangles. */
-.canvas-area { align-items: flex-start; justify-content: center; overflow: auto; background: #dfe3ea; background-image: none; padding: 22px 20px 42px; }
+.canvas-area { display: block; overflow-x: auto; overflow-y: scroll; background: #dfe3ea; background-image: none; padding: 22px 20px 42px; }
 .canvas-area:before { display: none; }
-.canvas-wrap { width: 820px !important; max-height: none; min-height: 1120px; align-items: flex-start; justify-content: center; }
+.canvas-wrap { width: 820px !important; max-height: none; min-height: 1120px; height: auto; margin: 0 auto; display: flex; flex: 0 0 auto; align-items: flex-start; justify-content: center; }
 .canvas-frame { width: 820px; max-width: none; max-height: none; overflow: visible; background: #fff; box-shadow: 0 18px 42px rgba(33, 39, 52, .18), 0 0 0 1px #cfd4de; line-height: normal; }
 .long-canvas { position: relative; width: 820px; min-height: 1120px; background: #fff; overflow: visible; transform-origin: top center; }
 .long-canvas #regionLayer, .long-canvas #paintLayer { position: absolute; inset: 0; width: 100%; height: 100%; }

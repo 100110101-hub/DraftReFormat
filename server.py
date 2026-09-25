@@ -352,8 +352,18 @@ def make_supervision_images(image_data_url: str, proposal: list[dict[str, Any]])
         raise RuntimeError(f"Unable to create supervision boundary images: {exc}") from exc
 
 
-def qwen_request(model_image: str | list[str], prompt: str, model: str | None = None) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
-    """Make one structured request to the configured Qwen vision model."""
+def qwen_request(
+    model_image: str | list[str],
+    prompt: str,
+    model: str | None = None,
+    history: list[dict[str, str]] | None = None,
+) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
+    """Make one structured request to the configured Qwen vision model.
+
+    Historical turns are deliberately text-only. This preserves the
+    segmentation agent's reasoning context without silently re-sending old
+    image payloads; only ``model_image`` is attached to the current turn.
+    """
 
     api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
     if not api_key:
@@ -361,10 +371,16 @@ def qwen_request(model_image: str | list[str], prompt: str, model: str | None = 
     images = [model_image] if isinstance(model_image, str) else model_image
     content = [{"type": "image_url", "image_url": {"url": image}} for image in images]
     content.append({"type": "text", "text": prompt})
+    messages = [
+        {"role": item["role"], "content": item["content"]}
+        for item in (history or [])
+        if item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str)
+    ]
+    messages.append({"role": "user", "content": content})
     payload = {
         "model": model or QWEN_MODEL,
         "temperature": 0.05,
-        "messages": [{"role": "user", "content": content}],
+        "messages": messages,
     }
     request = urllib.request.Request(QWEN_ENDPOINT, data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     global QWEN_LAST_ERROR
@@ -449,6 +465,66 @@ FIELD CONSTRAINTS
 - holes is optional; each hole is an object with absolute original-image x/y/w/h percentages and should be omitted when there is no internal exclusion.
 - If a field is not applicable, omit it entirely. Never emit null, empty strings, empty arrays, confidence, color, rotation, or any other extra field.
 - The response must start with { and end with }, with zero whitespace outside the JSON. Use double quotes, valid UTF-8, and no trailing commas."""
+
+
+def segmentation_revision_prompt(
+    current: list[dict[str, Any]],
+    issues: list[str],
+    supervisor_regions: list[dict[str, Any]],
+) -> str:
+    """Ask the original segmentation agent to revise a supervised proposal."""
+
+    return """Continue your role as the document-layout and semantic-cropping agent from the conversation history.
+
+You receive exactly two aligned images containing the same current candidate regions:
+1. Candidate Boundary Overlay: the original image at a compact scale with every current rectangle or exact polygon drawn over the source content.
+2. Enlarged Coordinate Boundary Overlay: an enlarged view with the same boundaries plus external numeric 0–100 X/Y axes. There are no interior grid lines.
+
+Each boundary is labeled with its region ID and group. Blue is a rectangular keep candidate. Purple is an exact polygon candidate; its thin blue rectangle is only its bounding box. Red is a deletion candidate. Orange rectangles are holes/cutouts. All colored lines, labels, axes, and outer padding are review overlays, not source content. No separate clean original image is supplied in this revision turn.
+
+Revise the complete region list using the supervisor feedback below. Return every valid region, including unchanged regions; never return a partial diff. Read precise coordinate values from the enlarged coordinate overlay, but measure all percentages against the original inner image, not the enlarged canvas or outer axes. Preserve every content edge and each complete semantic unit. Keep complete chemical equations, reaction pathways, mechanisms, arrows, conditions, catalysts, and connected annotations together. Keep boxed/crossed-out content as a separate delete region, keep nearby corrections separate, and preserve internal deletions as absolute-coordinate holes. Use polygons for triangular or irregular boundaries when needed.
+
+SUPERVISOR ISSUES
+""" + json.dumps(issues, ensure_ascii=False) + """
+
+CURRENT SEGMENTATION
+""" + json.dumps(current, ensure_ascii=False) + """
+
+SUPERVISOR'S CORRECTED REFERENCE
+""" + json.dumps(supervisor_regions, ensure_ascii=False) + """
+
+OUTPUT SPECIFICATION & SCHEMA
+Return strict, valid JSON only. Do not use markdown code blocks, comments, or explanatory text. The output must be directly parseable by a standard JSON parser.
+
+{
+  "regions": [
+    {
+      "id": "r1",
+      "label": "Reaction Pathway A",
+      "kind": "chemistry",
+      "x": 12.5,
+      "y": 8.2,
+      "w": 34.0,
+      "h": 21.5,
+      "group": "Q1",
+      "description": "Multi-step synthesis with catalyst labels",
+      "editAction": "delete",
+      "polygon": [[12.5,8.2],[46.5,8.2],[42.0,29.7],[15.0,29.7]],
+      "holes": [{"x": 20.0, "y": 15.0, "w": 10.0, "h": 5.0}]
+    }
+  ]
+}
+
+FIELD CONSTRAINTS
+- id is unique. label is concise English with at most five words and no trailing punctuation.
+- kind is exactly one of ["text", "image", "table", "chemistry", "biology", "formula", "other"]. Convert supervisor kinds such as chemical/diagram/annotation to the closest value in this enum.
+- x, y, w, h and polygon points are percentages in [0,100] relative to the original inner image; x+w<=100 and y+h<=100. Round them to one decimal place.
+- group is a logical grouping string. description is optional.
+- editAction is optional and exactly "keep" or "delete" when present. Omit ordinary "keep" values; default is "keep".
+- polygon is optional, contains at least three [x,y] pairs, and is omitted for sufficiently rectangular content.
+- holes is optional; each hole contains absolute original-image x/y/w/h percentages. Omit holes when none exist.
+- Omit every inapplicable field. Never emit null, empty strings, empty arrays, confidence, color, rotation, or extra fields.
+- The response must start with { and end with }, with zero whitespace outside the JSON. Use double quotes and no trailing commas."""
 
 
 def supervision_prompt(current: list[dict[str, Any]]) -> str:
@@ -597,11 +673,53 @@ def validate_supervision_response(payload: Any) -> list[str]:
     return issues[:12]
 
 
-def supervise_regions(original_image: str, proposal: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
-    """Have Qwen audit and correct the proposal, bounded to a safe number of rounds."""
+def revise_regions(
+    original_image: str,
+    current: list[dict[str, Any]],
+    issues: list[str],
+    supervisor_regions: list[dict[str, Any]],
+    history: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Continue the segmentation conversation using only the two overlay views."""
+
+    try:
+        revision_images = make_supervision_images(original_image, current)
+    except RuntimeError as exc:
+        return None, str(exc)
+    prompt = segmentation_revision_prompt(current, issues, supervisor_regions)
+    parsed, error = qwen_request(revision_images, prompt, history=history)
+    if not parsed:
+        return None, error or "分割 Agent 修改失败"
+    proposal = parsed.get("regions", []) if isinstance(parsed, dict) else []
+    if not isinstance(proposal, list) or not proposal:
+        return None, "分割 Agent 修改结果没有完整 regions"
+    revised = normalize_regions(
+        proposal,
+        precision=1,
+        include_confidence=False,
+        include_keep_action=False,
+    )
+    if not revised:
+        return None, "分割 Agent 修改结果没有有效区域"
+    # Preserve every successful text turn. Old image payloads are intentionally
+    # not duplicated; the current turn always receives freshly rendered views.
+    history.extend([
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))},
+    ])
+    return revised, None
+
+
+def supervise_regions(
+    original_image: str,
+    proposal: list[dict[str, Any]],
+    segmentation_history: list[dict[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Run supervisor review and splitter revisions, bounded to safe rounds."""
 
     current = proposal
     audit: list[dict[str, Any]] = []
+    splitter_history = list(segmentation_history or [])
     # Keep retrying until the supervisor passes, with a conservative hard cap
     # so a malformed model response cannot create an unbounded bill/loop.
     max_rounds = max(1, min(6, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "5"))))
@@ -621,23 +739,33 @@ def supervise_regions(original_image: str, proposal: list[dict[str, Any]]) -> tu
             audit.append({"round": round_number, "status": "revise", "issues": schema_issues[:8]})
             continue
         candidate = parsed.get("regions", []) if isinstance(parsed, dict) else []
-        if isinstance(candidate, list) and candidate:
-            corrected = normalize_regions(candidate, precision=2)
-            if corrected:
-                current = corrected
+        corrected = normalize_regions(candidate, precision=2) if isinstance(candidate, list) else []
         status = str(parsed.get("status", "revise")).lower() if isinstance(parsed, dict) else "revise"
         issues = parsed.get("issues", []) if isinstance(parsed, dict) else []
         if not isinstance(issues, list):
             issues = [str(issues)] if issues else []
         clean_issues = [str(item) for item in issues[:8]]
-        passed = status == "pass" and not clean_issues and bool(current)
+        passed = status == "pass" and not clean_issues and bool(corrected)
         audit.append({"round": round_number, "status": "pass" if passed else "revise", "issues": clean_issues})
         if passed:
-            return current, audit, True
+            return corrected, audit, True
+        if round_number >= max_rounds:
+            return corrected or current, audit, False
+        revised, revision_error = revise_regions(
+            original_image,
+            current,
+            clean_issues or ["Supervisor requested another complete boundary revision"],
+            corrected or current,
+            splitter_history,
+        )
+        if not revised:
+            audit[-1]["revisionError"] = revision_error or "分割 Agent 修改失败"
+            return corrected or current, audit, False
+        current = revised
     return current, audit, False
 
 
-def prepare_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str, dict[str, Any], str | None]:
+def prepare_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str, dict[str, Any], list[dict[str, str]] | None]:
     """Run the first segmentation request and return a coordinate proposal."""
 
     api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
@@ -645,13 +773,14 @@ def prepare_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, An
         return heuristic_regions(), "offline", {"status": "offline", "rounds": 0, "issues": ["未配置 API key"]}, None
 
     model_image = add_coordinate_grid(image_data_url)
-    parsed, error = qwen_request(model_image, segmentation_prompt(hint))
+    initial_prompt = segmentation_prompt(hint)
+    parsed, error = qwen_request(model_image, initial_prompt)
     if not parsed:
         print(f"Qwen request failed, using offline layout: {error}")
-        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [error or "初次分割失败"]}, model_image
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [error or "初次分割失败"]}, None
     proposal = parsed.get("regions", []) if isinstance(parsed, dict) else []
     if not isinstance(proposal, list) or not proposal:
-        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no regions"]}, model_image
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no regions"]}, None
     normalized = normalize_regions(
         proposal,
         precision=1,
@@ -659,21 +788,29 @@ def prepare_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, An
         include_keep_action=False,
     )
     if not normalized:
-        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no valid regions"]}, model_image
-    return normalized, "qwen-initial", {"status": "pending", "rounds": 0, "audit": []}, model_image
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no valid regions"]}, None
+    history = [
+        {"role": "user", "content": initial_prompt},
+        {"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))},
+    ]
+    return normalized, "qwen-initial", {"status": "pending", "rounds": 0, "audit": []}, history
 
 
 def call_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     """Run segmentation and supervision synchronously for CLI/benchmark callers."""
 
-    regions, source, supervision, model_image = prepare_qwen(image_data_url, hint)
-    if source != "qwen-initial" or not model_image:
+    regions, source, supervision, segmentation_history = prepare_qwen(image_data_url, hint)
+    if source != "qwen-initial" or not segmentation_history:
         return regions, source, supervision
-    regions, audit, passed = supervise_regions(image_data_url, regions)
+    regions, audit, passed = supervise_regions(image_data_url, regions, segmentation_history)
     return regions, "qwen-supervised", {"status": "pass" if passed else "max-rounds", "rounds": len(audit), "audit": audit}
 
 
-def start_supervision_job(proposal: list[dict[str, Any]], original_image: str) -> str:
+def start_supervision_job(
+    proposal: list[dict[str, Any]],
+    original_image: str,
+    segmentation_history: list[dict[str, str]],
+) -> str:
     """Continue supervision in the background so multiple jobs can run concurrently."""
 
     job_id = f"segment-{uuid.uuid4().hex}"
@@ -686,14 +823,23 @@ def start_supervision_job(proposal: list[dict[str, Any]], original_image: str) -
             "regions": normalize_regions(proposal),
             "supervision": {"status": "pending", "rounds": 0, "audit": []},
         }
-    thread = threading.Thread(target=_run_supervision_job, args=(job_id, proposal, original_image), daemon=True)
+    thread = threading.Thread(
+        target=_run_supervision_job,
+        args=(job_id, proposal, original_image, segmentation_history),
+        daemon=True,
+    )
     thread.start()
     return job_id
 
 
-def _run_supervision_job(job_id: str, proposal: list[dict[str, Any]], original_image: str) -> None:
+def _run_supervision_job(
+    job_id: str,
+    proposal: list[dict[str, Any]],
+    original_image: str,
+    segmentation_history: list[dict[str, str]],
+) -> None:
     try:
-        regions, audit, passed = supervise_regions(original_image, proposal)
+        regions, audit, passed = supervise_regions(original_image, proposal, segmentation_history)
         status = "pass" if passed else "max-rounds"
         if audit and audit[-1].get("status") == "error":
             status = "error"
@@ -917,10 +1063,10 @@ class Handler(BaseHTTPRequestHandler):
                 image = str(payload.get("image", ""))
                 if not image.startswith("data:image/"):
                     raise ValueError("需要一个图片 data URL")
-                regions, source, supervision, model_image = prepare_qwen(image, str(payload.get("hint", "")))
+                regions, source, supervision, segmentation_history = prepare_qwen(image, str(payload.get("hint", "")))
                 response: dict[str, Any] = {"regions": regions, "source": source, "model": QWEN_MODEL, "supervision": supervision}
-                if source == "qwen-initial" and model_image:
-                    job_id = start_supervision_job(regions, image)
+                if source == "qwen-initial" and segmentation_history:
+                    job_id = start_supervision_job(regions, image, segmentation_history)
                     response["jobId"] = job_id
                     response["supervision"] = {**supervision, "jobId": job_id}
                 json_response(self, response)

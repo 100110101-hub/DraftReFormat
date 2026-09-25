@@ -18,7 +18,9 @@ import server
 
 
 MODELS = [
-    "qwen-3.6-plus",
+    # These are the model IDs exposed by the configured MaaS workspace.
+    "qwen3.6-plus",
+    "qwen3.6-flash",
     "qwen3-vl-plus",
     "qwen3-vl-flash",
     "qwen-vl-max",
@@ -60,7 +62,14 @@ def main() -> None:
         started = time.perf_counter()
         parsed, error = server.qwen_request(image, PROMPT, model=model)
         elapsed = round(time.perf_counter() - started, 2)
-        regions = parsed.get("regions", []) if isinstance(parsed, dict) else []
+        if isinstance(parsed, dict):
+            regions = parsed.get("regions", [])
+        elif isinstance(parsed, list):
+            # Some compatible models return the requested JSON array directly
+            # instead of wrapping it in {"regions": [...]}.
+            regions = parsed
+        else:
+            regions = []
         complete = sum(all(key in item for key in ("x", "y", "w", "h")) for item in regions if isinstance(item, dict))
         report.append({"model": model, "seconds": elapsed, "ok": not bool(error), "error": error, "regions": len(regions), "completeCoordinates": complete})
         print(json.dumps(report[-1], ensure_ascii=False))

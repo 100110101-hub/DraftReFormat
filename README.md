@@ -9,8 +9,10 @@
 3. 运行 `python server.py`。
 3. 打开 `http://127.0.0.1:8765`。
 
-默认视觉模型为 `qwen-3.6-plus`，可用 `QWEN_MODEL` 覆盖。发送给 Qwen 的临时分析图会扩展白色边界并添加外侧 0–100 数值坐标轴，不画内部网格线；模型返回的坐标仍映射到无坐标轴原图，坐标轴不会出现在终稿中。
+默认视觉模型为 MaaS 工作空间实际暴露的 `qwen3.6-plus`，可用 `QWEN_MODEL` 覆盖。发送给 Qwen 的临时分析图会扩展白色边界并添加外侧 0–100 数值坐标轴，不画内部网格线；模型返回的坐标仍映射到无坐标轴原图，坐标轴不会出现在终稿中。
 
 `QWEN_ENDPOINT` 使用 MaaS 的 OpenAI 兼容地址，默认配置为工作空间的 `/compatible-mode/v1/chat/completions`。
+
+`QWEN_REQUEST_TIMEOUT` 默认 180 秒，适用于视觉模型在工作空间排队较久的情况。
 
 可用 `python benchmark_qwen.py` 对候选 Qwen 模型做同一张测试图的结构化坐标对比。该脚本不会输出 API Key；若 DashScope 返回 401，需要先更换为有效的 DashScope API Key。

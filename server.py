@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -51,10 +52,11 @@ load_dotenv()
 # Read Qwen settings after loading the local .env file.  This keeps explicit
 # process environment variables authoritative while allowing the normal local
 # setup (copying .env.example to .env) to configure the MaaS endpoint.
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-3.6-plus")
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.6-plus")
 QWEN_ENDPOINT = os.environ.get(
     "QWEN_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 )
+QWEN_REQUEST_TIMEOUT = float(os.environ.get("QWEN_REQUEST_TIMEOUT", "180"))
 QWEN_LAST_ERROR = ""
 
 
@@ -201,7 +203,7 @@ def qwen_request(model_image: str, prompt: str, model: str | None = None) -> tup
     request = urllib.request.Request(QWEN_ENDPOINT, data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     global QWEN_LAST_ERROR
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=QWEN_REQUEST_TIMEOUT) as response:
             body = json.loads(response.read().decode("utf-8"))
         content = body["choices"][0]["message"]["content"]
         if isinstance(content, list):
@@ -226,7 +228,7 @@ def qwen_request(model_image: str, prompt: str, model: str | None = None) -> tup
             detail = ""
         QWEN_LAST_ERROR = f"HTTP {exc.code}" + (f" {detail}" if detail else "")
         return None, QWEN_LAST_ERROR
-    except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, socket.timeout, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
         QWEN_LAST_ERROR = str(exc)
         return None, QWEN_LAST_ERROR
 

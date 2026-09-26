@@ -22,6 +22,7 @@ const state = {
   images: [],
   currentId: null,
   selectedRegionId: null,
+  selectedRegionKeys: [],
   tool: "select",
   zoom: 1,
   history: [],
@@ -33,7 +34,10 @@ const state = {
   hydrating: false,
   lastAnalyzed: null,
   lastSupervision: null,
+  showModelBoundaries: true,
   keepGroups: true,
+  draggingImageId: null,
+  suppressTileClick: false,
 };
 
 function demoImage() {
@@ -60,6 +64,7 @@ function init() {
   state.images = [demo, demo2];
   state.currentId = demo.id;
   state.selectedRegionId = demoRegions[1].id;
+  state.selectedRegionKeys = [regionKey(demo.id, demoRegions[1].id)];
   bindEvents();
   render();
   showToast("已加载演示草稿，可直接拖动分区开始编辑", "success");
@@ -67,12 +72,45 @@ function init() {
 
 function currentImage() { return state.images.find((image) => image.id === state.currentId) || null; }
 function selectedRegion() { const image = currentImage(); return image?.regions.find((region) => region.id === state.selectedRegionId) || null; }
-function snapshot() { return JSON.stringify({ images: state.images, currentId: state.currentId, selectedRegionId: state.selectedRegionId, paintPaths: state.paintPaths, whiteRects: state.whiteRects, layoutWhiteRects: state.layoutWhiteRects, layoutPaintPaths: state.layoutPaintPaths }); }
-function restoreSnapshot(value) { const parsed = JSON.parse(value); state.images = parsed.images; state.currentId = parsed.currentId; state.selectedRegionId = parsed.selectedRegionId; state.paintPaths = parsed.paintPaths || {}; state.whiteRects = parsed.whiteRects || {}; state.layoutWhiteRects = parsed.layoutWhiteRects || []; state.layoutPaintPaths = parsed.layoutPaintPaths || []; render(); }
+function regionKey(imageId, regionId) { return `${imageId}::${regionId}`; }
+function selectedRegionEntries() {
+  const entries = [];
+  for (const key of state.selectedRegionKeys || []) {
+    const split = key.indexOf("::");
+    const imageId = key.slice(0, split), regionId = key.slice(split + 2);
+    const image = state.images.find((item) => item.id === imageId);
+    const region = image?.regions.find((item) => item.id === regionId);
+    if (image && region) entries.push({ image, region });
+  }
+  if (!entries.length) { const image = currentImage(), region = selectedRegion(); if (image && region) entries.push({ image, region }); }
+  return entries;
+}
+function setSelection(entries, primary = entries[0]) {
+  state.selectedRegionKeys = [...new Set(entries.map(({ image, region }) => regionKey(image.id, region.id)))];
+  if (primary) { state.currentId = primary.image.id; state.selectedRegionId = primary.region.id; }
+  else { state.selectedRegionId = null; }
+  updateTileSelectionClasses();
+}
+function updateTileSelectionClasses() {
+  const keys = new Set(state.selectedRegionKeys || []);
+  $$(".region-tile").forEach((tile) => {
+    const selected = keys.has(regionKey(tile.dataset.imageId, tile.dataset.regionId));
+    tile.classList.toggle("selected", selected && tile.dataset.imageId === state.currentId && tile.dataset.regionId === state.selectedRegionId);
+    tile.classList.toggle("multi-selected", selected && (state.selectedRegionKeys || []).length > 1);
+  });
+}
+function snapshot() { return JSON.stringify({ images: state.images, currentId: state.currentId, selectedRegionId: state.selectedRegionId, selectedRegionKeys: state.selectedRegionKeys, paintPaths: state.paintPaths, whiteRects: state.whiteRects, layoutWhiteRects: state.layoutWhiteRects, layoutPaintPaths: state.layoutPaintPaths }); }
+function restoreSnapshot(value) { const parsed = JSON.parse(value); state.images = parsed.images; state.currentId = parsed.currentId; state.selectedRegionId = parsed.selectedRegionId; state.selectedRegionKeys = parsed.selectedRegionKeys || []; state.paintPaths = parsed.paintPaths || {}; state.whiteRects = parsed.whiteRects || {}; state.layoutWhiteRects = parsed.layoutWhiteRects || []; state.layoutPaintPaths = parsed.layoutPaintPaths || []; render(); }
 function pushHistory() {
   const image = currentImage();
   if (image?.supervisionPending && !image.applyingSupervision) image.supervisionUserEdited = true;
   state.history.push(snapshot()); if (state.history.length > 35) state.history.shift(); state.redo = [];
+}
+function pushHistorySnapshot(before) {
+  if (!before || before === snapshot()) return;
+  const image = currentImage();
+  if (image?.supervisionPending && !image.applyingSupervision) image.supervisionUserEdited = true;
+  state.history.push(before); if (state.history.length > 35) state.history.shift(); state.redo = [];
 }
 function undo() { if (!state.history.length) return showToast("没有可撤销的操作", "warn"); state.redo.push(snapshot()); restoreSnapshot(state.history.pop()); }
 function redo() { if (!state.redo.length) return showToast("没有可重做的操作", "warn"); state.history.push(snapshot()); restoreSnapshot(state.redo.pop()); }
@@ -97,23 +135,43 @@ function render() {
 function renderAssets() {
   const list = $("#assetList");
   if (!state.images.length) { list.innerHTML = '<div class="empty-assets">还没有导入素材</div>'; return; }
-  list.innerHTML = state.images.map((image, index) => `<div class="asset-item ${image.id === state.currentId ? "active" : ""}" data-image-id="${image.id}">
-    <img class="asset-thumb" src="${image.src}" alt=""/><div class="asset-info"><div class="asset-name">${escapeHtml(image.name)}</div><div class="asset-meta"><i></i>${image.regions.length ? `${image.regions.length} 个内容块` : "待分析"}<span>·</span>${image.size || "网页素材"}</div></div><span class="asset-index">${String(index + 1).padStart(2, "0")}</span><button class="asset-delete" data-delete-image="${image.id}" title="删除素材">×</button></div>`).join("");
-  $$(".asset-item").forEach((item) => item.addEventListener("click", () => { state.currentId = item.dataset.imageId; state.selectedRegionId = currentImage()?.regions[0]?.id || null; render(); }));
+  list.innerHTML = state.images.map((image, index) => `<div class="asset-item ${image.id === state.currentId ? "active" : ""}" data-image-id="${image.id}" draggable="true" title="拖动排序素材页面">
+    <img class="asset-thumb" src="${image.src}" alt=""/><div class="asset-info"><div class="asset-name">${escapeHtml(image.name)}</div><div class="asset-meta"><i></i>${image.regions.length ? `${image.regions.length} 个内容块` : "待分析"}<span>·</span>${image.size || "网页素材"}</div></div><span class="asset-index">${String(index + 1).padStart(2, "0")}</span><span class="asset-move-actions"><button data-move-image="${image.id}" data-direction="-1" aria-label="上移 ${escapeHtml(image.name)}" title="上移素材" ${index === 0 ? "disabled" : ""}>↑</button><button data-move-image="${image.id}" data-direction="1" aria-label="下移 ${escapeHtml(image.name)}" title="下移素材" ${index === state.images.length - 1 ? "disabled" : ""}>↓</button></span><button class="asset-delete" data-delete-image="${image.id}" title="删除素材">×</button></div>`).join("");
+  $$(".asset-item").forEach((item) => {
+    item.addEventListener("click", () => { if (state.draggingImageId) return; const image = state.images.find((entry) => entry.id === item.dataset.imageId); if (!image) return; state.currentId = image.id; setSelection(image.regions[0] ? [{ image, region: image.regions[0] }] : []); render(); });
+    item.addEventListener("dragstart", (event) => { state.draggingImageId = item.dataset.imageId; item.classList.add("dragging"); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", state.draggingImageId); });
+    item.addEventListener("dragover", (event) => { if (!state.draggingImageId || state.draggingImageId === item.dataset.imageId) return; event.preventDefault(); item.classList.add("drop-target"); });
+    item.addEventListener("dragleave", () => item.classList.remove("drop-target"));
+    item.addEventListener("drop", (event) => { event.preventDefault(); item.classList.remove("drop-target"); const sourceId = state.draggingImageId || event.dataTransfer.getData("text/plain"); reorderAssets(sourceId, item.dataset.imageId); });
+    item.addEventListener("dragend", () => { state.draggingImageId = null; $$(".asset-item").forEach((entry) => entry.classList.remove("dragging", "drop-target")); });
+  });
   $$("[data-delete-image]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); deleteImage(button.dataset.deleteImage); }));
+  $$("[data-move-image]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); moveAsset(button.dataset.moveImage, Number(button.dataset.direction)); }));
 }
 
 function renderRegions() {
   const layer = $("#regionLayer");
   const items = visualRegions();
   const positionedItems = items.filter(({ region }) => hasRegionLayout(region));
-  layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${positionedItems.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""} ${region.cropSrc ? "" : "crop-preview-pending"}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX}px;top:${region.layoutY}px;width:${region.layoutW}px;height:${region.layoutH}px;border-color:${kindColors[region.kind] || kindColors.other};z-index:${region.zIndex || 2}">
-    ${region.cropSrc ? `<img src="${region.cropSrc}" alt="${escapeHtml(region.label)}" draggable="false"/>` : ""}<div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span></div>`).join("")}`;
+  layer.innerHTML = `${positionedItems.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""} ${(state.selectedRegionKeys || []).includes(regionKey(image.id, region.id)) && (state.selectedRegionKeys || []).length > 1 ? "multi-selected" : ""} ${region.cropSrc ? "" : "crop-preview-pending"}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" data-tool="${state.tool}" style="left:${region.layoutX}px;top:${region.layoutY}px;width:${region.layoutW}px;height:${region.layoutH}px;border-color:${kindColors[region.kind] || kindColors.other};z-index:${region.zIndex || 2}">
+    ${region.cropSrc ? `<img src="${region.cropSrc}" alt="${escapeHtml(region.label)}" draggable="false"/>` : ""}${renderRegionBoundarySvg(region, 100, 100, "model-boundary-overlay", region.layoutW, region.layoutH)}<div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span></div>`).join("")}`;
   $$(".region-tile").forEach((box) => {
     box.addEventListener("pointerdown", (event) => startRegionPointer(event, box));
-    box.addEventListener("click", (event) => { event.stopPropagation(); state.currentId = box.dataset.imageId; state.selectedRegionId = box.dataset.regionId; renderRegions(); renderInspector(); });
+    box.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (state.suppressTileClick) { state.suppressTileClick = false; return; }
+      const image = state.images.find((item) => item.id === box.dataset.imageId), region = image?.regions.find((item) => item.id === box.dataset.regionId);
+      if (!image || !region) return;
+      const entry = { image, region };
+      if (event.shiftKey) {
+        const entries = selectedRegionEntries(), key = regionKey(image.id, region.id);
+        setSelection(entries.some((item) => regionKey(item.image.id, item.region.id) === key) ? entries.filter((item) => regionKey(item.image.id, item.region.id) !== key) : [...entries, entry], entry);
+      } else setSelection([entry], entry);
+      renderRegions(); renderInspector();
+    });
   });
   updateOutputCanvasSize(positionedItems);
+  updateBoundaryVisibility();
   if (!state.hydrating && items.some(({ region, image }) => !region.cropSrc && (!region.synthetic || !image.previewReady))) hydrateVisualRegions();
 }
 
@@ -121,6 +179,42 @@ function hasRegionLayout(region) {
   return Number.isFinite(region.layoutX) && Number.isFinite(region.layoutY)
     && Number.isFinite(region.layoutW) && region.layoutW > 0
     && Number.isFinite(region.layoutH) && region.layoutH > 0;
+}
+
+function renderRegionBoundarySvg(region, targetWidth, targetHeight, className, visualWidth = targetWidth, visualHeight = targetHeight) {
+  if (!region || region.synthetic) return "";
+  const polygon = regionPolygon(region);
+  const sourceX = Number(region.x) || 0, sourceY = Number(region.y) || 0;
+  const sourceW = Math.max(.001, Number(region.w) || 1), sourceH = Math.max(.001, Number(region.h) || 1);
+  const map = ([x, y]) => [((Number(x) - sourceX) / sourceW * targetWidth).toFixed(3), ((Number(y) - sourceY) / sourceH * targetHeight).toFixed(3)];
+  const polygons = [polygon, ...(region.holes || []).map((hole) => hole?.polygon).filter((points) => Array.isArray(points) && points.length >= 3)];
+  const compensateX = targetWidth / Math.max(.001, Number(visualWidth) || targetWidth);
+  const compensateY = targetHeight / Math.max(.001, Number(visualHeight) || targetHeight);
+  const geometry = polygons.map((points) => {
+    const mapped = points.map(map).map(([x, y]) => [Number(x), Number(y)]);
+    const coords = mapped.map((point) => point.map((value) => value.toFixed(3)).join(",")).join(" ");
+    const center = [mapped.reduce((sum, point) => sum + point[0], 0) / mapped.length, mapped.reduce((sum, point) => sum + point[1], 0) / mapped.length];
+    const vertices = mapped.map(([x, y], index) => {
+      const placeLeft = x > center[0], placeBelow = y < center[1];
+      const labelX = placeLeft ? -5 : 5;
+      const labelY = placeBelow ? Math.min((Number(visualHeight) || targetHeight) * .42, 28) : -Math.min((Number(visualHeight) || targetHeight) * .42, 8);
+      return `<g class="boundary-vertex" transform="translate(${x.toFixed(3)} ${y.toFixed(3)})"><g transform="scale(${compensateX} ${compensateY})"><circle r="3"></circle><text x="${labelX}" y="${labelY}" text-anchor="${placeLeft ? "end" : "start"}">V${index + 1}</text></g></g>`;
+    }).join("");
+    return `<polygon class="model-boundary-underlay" points="${coords}"/><polygon class="model-boundary-line" points="${coords}"/>${vertices}`;
+  }).join("");
+  return `<svg class="${className}" viewBox="0 0 ${targetWidth} ${targetHeight}" preserveAspectRatio="none" aria-hidden="true">${geometry}</svg>`;
+}
+
+function updateBoundaryVisibility() {
+  const hidden = !state.showModelBoundaries;
+  $("#outputCanvas")?.classList.toggle("model-boundaries-hidden", hidden);
+  $("#selectedPreview")?.classList.toggle("model-boundaries-hidden", hidden);
+  const button = $("#boundaryLabelsToggle");
+  if (button) {
+    button.classList.toggle("active", !hidden);
+    button.setAttribute("aria-pressed", String(!hidden));
+    button.title = hidden ? "显示模型多边形边界与顶点编号" : "隐藏模型多边形边界与顶点编号";
+  }
 }
 
 function visualRegions() {
@@ -206,6 +300,65 @@ function normalizeLongLayout() {
     });
     y += 20;
   });
+  captureHomePageLayout();
+}
+
+function captureHomePageLayout() {
+  state.images.forEach((image) => {
+    const regions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
+    if (!regions.length || regions.some((region) => !hasRegionLayout(region))) return;
+    const top = Math.min(...regions.map((region) => Number.isFinite(region.layoutY) ? region.layoutY : 28));
+    const bottom = Math.max(...regions.map((region) => (Number.isFinite(region.layoutY) ? region.layoutY : top) + (Number.isFinite(region.layoutH) ? region.layoutH : 1)));
+    if (!Number.isFinite(image.homePageHeight)) image.homePageHeight = bottom - top;
+    regions.forEach((region) => {
+      if (!Number.isFinite(region.homeLayoutX)) region.homeLayoutX = Number.isFinite(region.layoutX) ? region.layoutX : 28;
+      if (!Number.isFinite(region.homeLayoutY)) region.homeLayoutY = (Number.isFinite(region.layoutY) ? region.layoutY : top) - top;
+    });
+  });
+}
+
+function restoreHomePagePositions() {
+  captureHomePageLayout();
+  let pageTop = 28;
+  state.images.forEach((image) => {
+    const regions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
+    image.layoutPageY = pageTop;
+    let pageBottom = 0;
+    regions.forEach((region) => {
+      region.layoutX = Number.isFinite(region.homeLayoutX) ? region.homeLayoutX : 28;
+      region.layoutY = pageTop + (Number.isFinite(region.homeLayoutY) ? region.homeLayoutY : 0);
+      region.userMoved = false;
+      pageBottom = Math.max(pageBottom, (region.homeLayoutY || 0) + (region.layoutH || 1));
+    });
+    const pageHeight = Math.max(Number(image.homePageHeight) || 0, pageBottom);
+    image.homePageHeight = pageHeight;
+    pageTop += pageHeight + 40;
+  });
+}
+
+function reorderAssets(sourceId, targetId, sortedImages = null) {
+  if (sortedImages) {
+    if (state.images.every((image, index) => image.id === sortedImages[index]?.id)) return;
+    pushHistory(); captureHomePageLayout(); state.images = sortedImages; restoreHomePagePositions();
+  } else {
+    if (!sourceId || !targetId || sourceId === targetId) { state.draggingImageId = null; return; }
+    const from = state.images.findIndex((image) => image.id === sourceId), to = state.images.findIndex((image) => image.id === targetId);
+    if (from < 0 || to < 0) return;
+    pushHistory(); captureHomePageLayout();
+    const [image] = state.images.splice(from, 1); state.images.splice(to, 0, image); restoreHomePagePositions();
+  }
+  state.draggingImageId = null;
+  render();
+  showToast("素材页面已重排；各块随来源页移动，跨页块已归回原页", "success");
+}
+
+function moveAsset(imageId, offset) {
+  const from = state.images.findIndex((image) => image.id === imageId);
+  const to = clamp(from + offset, 0, state.images.length - 1);
+  if (from < 0 || from === to) return;
+  const sorted = [...state.images], [image] = sorted.splice(from, 1);
+  sorted.splice(to, 0, image);
+  reorderAssets(null, null, sorted);
 }
 
 function renderStats() {
@@ -218,9 +371,15 @@ function renderStats() {
 }
 
 function renderInspector() {
+  const entries = selectedRegionEntries();
   const region = selectedRegion();
-  $("#noSelection").hidden = !!region;
-  $("#regionInspector").hidden = !region;
+  const multi = entries.length > 1;
+  $("#multiSelectionSummary").hidden = !multi;
+  $("#multiSelectionCount").textContent = `${entries.length} 个内容块已选中`;
+  $("#noSelection").hidden = entries.length > 0;
+  $("#regionInspector").hidden = entries.length === 0;
+  $("#regionInspector").classList.toggle("multi-mode", multi);
+  $("#removeInspectorRegion").textContent = multi ? `移除选中的 ${entries.length} 个内容块` : "移除该内容块";
   if (!region) return;
   $("#previewType").textContent = kindShort[region.kind] || "BLOCK";
   $("#previewGroup").textContent = `集合 ${region.group || "—"}`;
@@ -228,8 +387,122 @@ function renderInspector() {
   $("#regionKind").textContent = kindNames[region.kind] || kindNames.other;
   $("#regionGroup").value = region.group || "";
   $("#groupBadge").textContent = region.group || "—";
-  $("#regionX").value = region.x; $("#regionY").value = region.y; $("#regionW").value = region.w; $("#regionH").value = region.h;
+  renderPolygonEditor(region);
+  $$("#regionInspector .single-region-control :is(input,button,select)").forEach((control) => { control.disabled = multi; });
   const confidence = Math.round((region.confidence ?? .6) * 100); $("#confidenceValue").textContent = `${confidence}%`; $("#confidenceBar").style.width = `${confidence}%`; $("#regionDescription").textContent = region.description || "语义内容区域";
+}
+
+function regionPolygon(region) {
+  if (Array.isArray(region.polygon) && region.polygon.length >= 3) return region.polygon;
+  const x = Number(region.x) || 0, y = Number(region.y) || 0;
+  const w = Number(region.w) || 1, h = Number(region.h) || 1;
+  region.polygon = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+  return region.polygon;
+}
+
+function renderPolygonEditor(region) {
+  const polygon = regionPolygon(region);
+  const xs = polygon.map((point) => Number(point[0])), ys = polygon.map((point) => Number(point[1]));
+  const minX = Math.min(...xs), minY = Math.min(...ys), width = Math.max(.001, Math.max(...xs) - minX), height = Math.max(.001, Math.max(...ys) - minY);
+  $("#polygonPreview").setAttribute("viewBox", `0 0 ${width} ${height}`);
+  const previewRect = $("#polygonPreview").getBoundingClientRect();
+  $("#polygonPreview").innerHTML = `<polygon class="preview-polygon-fill" points="${polygon.map(([x, y]) => `${(x - minX).toFixed(3)},${(y - minY).toFixed(3)}`).join(" ")}"/>${renderRegionBoundarySvg(region, width, height, "preview-model-boundary", previewRect.width, previewRect.height)}`;
+  $("#polygonVertices").innerHTML = polygon.map(([x, y], index) => `<div class="polygon-vertex-row" data-vertex-index="${index}"><strong>V${index + 1}</strong><label>X<input type="number" min="0" max="100" step="0.1" value="${Number(x).toFixed(2)}" data-vertex-axis="0" aria-label="顶点 ${index + 1} X" /></label><label>Y<input type="number" min="0" max="100" step="0.1" value="${Number(y).toFixed(2)}" data-vertex-axis="1" aria-label="顶点 ${index + 1} Y" /></label><button type="button" data-remove-vertex="${index}" title="移除此顶点" ${polygon.length <= 3 ? "disabled" : ""}>×</button></div>`).join("");
+  updateBoundaryVisibility();
+}
+
+function polygonArea(polygon) {
+  return Math.abs(polygon.reduce((sum, [x, y], index) => {
+    const [nextX, nextY] = polygon[(index + 1) % polygon.length];
+    return sum + x * nextY - nextX * y;
+  }, 0)) / 2;
+}
+
+function polygonSelfIntersects(polygon) {
+  const orient = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  const intersects = (a, b, c, d) => {
+    const abC = orient(a, b, c), abD = orient(a, b, d), cdA = orient(c, d, a), cdB = orient(c, d, b);
+    return abC * abD < -1e-9 && cdA * cdB < -1e-9;
+  };
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i], b = polygon[(i + 1) % polygon.length];
+    for (let j = i + 1; j < polygon.length; j++) {
+      if (j === i || j === (i + 1) % polygon.length || i === (j + 1) % polygon.length) continue;
+      if (intersects(a, b, polygon[j], polygon[(j + 1) % polygon.length])) return true;
+    }
+  }
+  return false;
+}
+
+function setRegionPolygon(image, region, polygon) {
+  if (!Array.isArray(polygon) || polygon.length < 3 || polygon.some((point) => !Array.isArray(point) || point.length !== 2 || point.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 100)) || polygonArea(polygon) < .001 || polygonSelfIntersects(polygon)) {
+    showToast("多边形无效：请检查顶点范围、面积及交叉边", "warn");
+    return false;
+  }
+  const oldX = Number(region.x) || 0, oldY = Number(region.y) || 0;
+  const oldW = Math.max(.001, Number(region.w) || 1), oldH = Math.max(.001, Number(region.h) || 1);
+  const xs = polygon.map(([x]) => x), ys = polygon.map(([, y]) => y);
+  const x = Math.min(...xs), y = Math.min(...ys), w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+  const sourceWidth = Number(image.sourceWidth) || 760, sourceHeight = Number(image.sourceHeight) || 1000;
+  const scale = Number(image.displayScale) || Math.min(1, 760 / Math.max(1, sourceWidth));
+  const dx = (x - oldX) / 100 * sourceWidth * scale, dy = (y - oldY) / 100 * sourceHeight * scale;
+  if (hasRegionLayout(region)) {
+    region.layoutX += dx; region.layoutY += dy;
+    region.layoutW = Math.max(1, sourceWidth * w / 100 * scale);
+    region.layoutH = Math.max(1, sourceHeight * h / 100 * scale);
+  }
+  if (Number.isFinite(region.homeLayoutX)) region.homeLayoutX += dx;
+  if (Number.isFinite(region.homeLayoutY)) region.homeLayoutY += dy;
+  const remapLocalPoint = ([px, py]) => [((oldX + Number(px) * oldW / 100) - x) / w * 100, ((oldY + Number(py) * oldH / 100) - y) / h * 100];
+  if (Array.isArray(region.whiteoutPolygons)) region.whiteoutPolygons = region.whiteoutPolygons.map((points) => points.map(remapLocalPoint));
+  if (Array.isArray(region.whiteoutPaths)) region.whiteoutPaths = region.whiteoutPaths.map((path) => ({
+    ...path,
+    points: (path.points || []).map(remapLocalPoint),
+    width: (Number(path.width) || 1) * oldW / w,
+  }));
+  region.x = x; region.y = y; region.w = w; region.h = h; region.polygon = polygon.map(([px, py]) => [+px.toFixed(3), +py.toFixed(3)]);
+  region.userMoved = true;
+  region.cropSrc = null;
+  image.previewReady = false;
+  return true;
+}
+
+function editPolygonVertex(index, axis, value) {
+  const { image, region } = selectedRegionEntries()[0] || {};
+  if (!image || !region || !Number.isFinite(value)) return;
+  const polygon = regionPolygon(region).map((point) => [...point]);
+  if (!polygon[index] || ![0, 1].includes(axis)) return;
+  polygon[index][axis] = clamp(value, 0, 100);
+  pushHistory();
+  if (setRegionPolygon(image, region, polygon)) render();
+  else renderInspector();
+}
+
+function addPolygonVertex() {
+  const { image, region } = selectedRegionEntries()[0] || {};
+  if (!image || !region) return;
+  const polygon = regionPolygon(region).map((point) => [...point]);
+  const sourceWidth = Number(image.sourceWidth) || 760, sourceHeight = Number(image.sourceHeight) || 1000;
+  let edgeIndex = 0, longest = -1;
+  polygon.forEach((point, index) => {
+    const next = polygon[(index + 1) % polygon.length];
+    const length = ((next[0] - point[0]) * sourceWidth) ** 2 + ((next[1] - point[1]) * sourceHeight) ** 2;
+    if (length > longest) { longest = length; edgeIndex = index; }
+  });
+  const next = polygon[(edgeIndex + 1) % polygon.length];
+  polygon.splice(edgeIndex + 1, 0, [(polygon[edgeIndex][0] + next[0]) / 2, (polygon[edgeIndex][1] + next[1]) / 2]);
+  pushHistory();
+  if (setRegionPolygon(image, region, polygon)) render();
+}
+
+function removePolygonVertex(index) {
+  const { image, region } = selectedRegionEntries()[0] || {};
+  if (!image || !region) return;
+  const polygon = regionPolygon(region).map((point) => [...point]);
+  if (polygon.length <= 3 || index < 0 || index >= polygon.length) return;
+  polygon.splice(index, 1); pushHistory();
+  if (setRegionPolygon(image, region, polygon)) render();
+  else renderInspector();
 }
 
 function bindEvents() {
@@ -247,65 +520,289 @@ function bindEvents() {
   $("#exportButton").addEventListener("click", exportFinal); $("#inspectorExport").addEventListener("click", exportFinal);
   $("#deleteRegion").addEventListener("click", deleteSelected); $("#removeInspectorRegion").addEventListener("click", deleteSelected);
   $("#splitRegionButton").addEventListener("click", segmentSelectedRegion);
+  $("#reanalyzeRegionButton").addEventListener("click", reanalyzeSelectedRegion);
+  $("#boundaryLabelsToggle").addEventListener("click", () => { state.showModelBoundaries = !state.showModelBoundaries; updateBoundaryVisibility(); });
   $("#clearWhiteouts").addEventListener("click", clearWhiteouts);
   $("#renameProject").addEventListener("click", () => { const name = prompt("项目名称", state.projectName); if (name?.trim()) { state.projectName = name.trim(); render(); } });
-  $("#sortImages").addEventListener("click", () => { pushHistory(); state.images.sort((a, b) => a.name.localeCompare(b.name, "zh")); render(); showToast("已按文件名排序", "success"); });
+  $("#sortImages").addEventListener("click", () => reorderAssets(null, null, [...state.images].sort((a, b) => a.name.localeCompare(b.name, "zh", { numeric: true }))));
+  $("#sortImagesByName").addEventListener("click", () => reorderAssets(null, null, [...state.images].sort((a, b) => a.name.localeCompare(b.name, "zh"))));
   $("#kindSelect").addEventListener("click", () => $("#kindMenu").classList.toggle("open"));
   $$("#kindMenu button").forEach((button) => button.addEventListener("click", () => { const region = selectedRegion(); if (!region) return; pushHistory(); region.kind = button.dataset.kind; render(); }));
   $$(".suggestion-row button").forEach((button) => button.addEventListener("click", () => { const region = selectedRegion(); if (!region) return; pushHistory(); region.label = button.dataset.label; render(); }));
   $("#regionLabel").addEventListener("change", (event) => updateSelected("label", event.target.value));
   $("#regionGroup").addEventListener("change", (event) => updateSelected("group", event.target.value || "A"));
   $("#newGroupButton").addEventListener("click", () => { const region = selectedRegion(); if (!region) return; pushHistory(); region.group = nextGroup(); render(); });
-  ["X", "Y", "W", "H"].forEach((key) => $("#region" + key).addEventListener("change", (event) => updateSelected(key.toLowerCase(), Number(event.target.value))));
+  $("#polygonVertices").addEventListener("change", (event) => { const input = event.target.closest("[data-vertex-axis]"); if (!input) return; editPolygonVertex(Number(input.closest("[data-vertex-index]").dataset.vertexIndex), Number(input.dataset.vertexAxis), input.value.trim() === "" ? NaN : Number(input.value)); });
+  $("#polygonVertices").addEventListener("click", (event) => { const button = event.target.closest("[data-remove-vertex]"); if (button) removePolygonVertex(Number(button.dataset.removeVertex)); });
+  $("#addPolygonVertex").addEventListener("click", addPolygonVertex);
   $("#layerBottom").addEventListener("click", () => changeLayer("bottom")); $("#layerDown").addEventListener("click", () => changeLayer("down")); $("#layerUp").addEventListener("click", () => changeLayer("up")); $("#layerTop").addEventListener("click", () => changeLayer("top"));
   $("#keepGroupsToggle").addEventListener("click", () => { state.keepGroups = !state.keepGroups; $("#keepGroupsToggle").classList.toggle("on", state.keepGroups); });
+  $("#pageMargin").addEventListener("change", (event) => { event.target.value = String(clamp(Number(event.target.value), 0, 120)); });
   $$(".tool-button").forEach((button) => button.addEventListener("click", () => setTool(button.dataset.tool)));
   const frame = $("#canvasFrame");
   frame.addEventListener("pointerdown", startCanvasPointer);
-  $("#paintLayer").addEventListener("pointerdown", startBrushStroke);
   document.addEventListener("keydown", (event) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); } if (event.key === "Escape") { setTool("select"); $("#kindMenu").classList.remove("open"); } });
   window.addEventListener("resize", () => { resizePaintCanvas(); drawPaint(); });
   $("#canvasArea").addEventListener("wheel", (event) => { if (Math.abs(event.deltaY) > 0) { event.preventDefault(); $("#canvasArea").scrollTop += event.deltaY; } }, { passive: false });
 }
 
-function setTool(tool) { state.tool = tool; setToolVisuals(); $("#canvasFrame").classList.toggle("painting", tool === "brush"); }
+function setTool(tool) { state.tool = tool; setToolVisuals(); $$(".region-tile").forEach((tile) => { tile.dataset.tool = tool; }); }
 function setToolVisuals() { $$(".tool-button").forEach((button) => button.classList.toggle("active", button.dataset.tool === state.tool)); const name = { select: "选择", draw: "分区", brush: "涂白", cover: "覆盖" }[state.tool]; $("#toolHint").textContent = name; }
 function applyZoom() { $("#zoomLabel").textContent = `${Math.round(state.zoom * 100)}%`; const canvas = $("#outputCanvas"); if (canvas) canvas.style.zoom = state.zoom; $("#canvasWrap").style.width = "820px"; }
 
 function startRegionPointer(event, box) {
-  if (state.tool !== "select") return;
   event.stopPropagation(); event.preventDefault();
-  const image = state.images.find((item) => item.id === box.dataset.imageId); const region = image?.regions.find((item) => item.id === box.dataset.regionId); if (!region) return;
-  state.currentId = image.id; state.selectedRegionId = region.id; renderInspector(); renderRegions();
-  const canvasRect = $("#outputCanvas").getBoundingClientRect(); const sx = event.clientX; const sy = event.clientY; const original = { x: region.layoutX || 28, y: region.layoutY || 28 };
-  const scale = state.zoom || 1;
-  const move = (moveEvent) => { const dx = (moveEvent.clientX - sx) / scale; const dy = (moveEvent.clientY - sy) / scale; region.layoutX = clamp(original.x + dx, 8, Math.max(8, 800 - (region.layoutW || 1))); region.layoutY = Math.max(8, original.y + dy); region.userMoved = true; renderRegions(); renderInspector(); };
-  const up = () => { pushHistory(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+  const image = state.images.find((item) => item.id === box.dataset.imageId);
+  const region = image?.regions.find((item) => item.id === box.dataset.regionId);
+  if (!image || !region) return;
+  const entry = { image, region }, key = regionKey(image.id, region.id);
+  if (state.tool === "draw") return startPolygonCut(event, box, entry);
+  if (state.tool === "cover") return startRegionCover(event, box, entry);
+  if (state.tool === "brush") return startRegionBrush(event, box, entry);
+
+  if (event.shiftKey) {
+    const entries = selectedRegionEntries();
+    setSelection(entries.some((item) => regionKey(item.image.id, item.region.id) === key)
+      ? entries.filter((item) => regionKey(item.image.id, item.region.id) !== key)
+      : [...entries, entry], entry);
+    renderInspector(); renderRegions(); state.suppressTileClick = true;
+    return;
+  }
+  const currentEntries = selectedRegionEntries();
+  const selected = currentEntries.some((item) => regionKey(item.image.id, item.region.id) === key)
+    ? currentEntries : [entry];
+  setSelection(selected, entry);
+  renderInspector(); updateTileSelectionClasses();
+  const before = snapshot(), sx = event.clientX, sy = event.clientY, scale = state.zoom || 1;
+  const origins = selectedRegionEntries().map((item) => ({ ...item, x: item.region.layoutX, y: item.region.layoutY }));
+  let moved = false;
+  const move = (moveEvent) => {
+    const dx = (moveEvent.clientX - sx) / scale, dy = (moveEvent.clientY - sy) / scale;
+    if (!moved && Math.abs(dx) + Math.abs(dy) < 2) return;
+    moved = true;
+    origins.forEach(({ region: item, x, y }) => {
+      item.layoutX = clamp(x + dx, 8, Math.max(8, 800 - (item.layoutW || 1)));
+      item.layoutY = Math.max(8, y + dy); item.userMoved = true;
+    });
+    renderRegions();
+  };
+  const up = () => {
+    if (moved) { pushHistorySnapshot(before); state.suppressTileClick = true; renderInspector(); }
+    window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+  };
   window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
 }
 
 function startCanvasPointer(event) {
   if (event.target.closest(".region-box, .region-tile") || !currentImage()) return;
-  const canvasRect = $("#outputCanvas").getBoundingClientRect(); const start = canvasPoint(event.clientX, event.clientY, canvasRect);
-  if (state.tool === "draw" || state.tool === "cover") {
-    event.preventDefault(); let preview;
-    if (state.tool === "draw") { preview = document.createElement("div"); preview.className = "region-box selected"; preview.style.cssText = `left:${start.x}px;top:${start.y}px;width:0;height:0;border-style:dashed`; $("#regionLayer").appendChild(preview); }
-    else { preview = document.createElement("div"); preview.style.cssText = `position:absolute;left:${start.x}px;top:${start.y}px;width:0;height:0;background:rgba(255,255,255,.8);z-index:4`; $("#regionLayer").appendChild(preview); }
-    const move = (moveEvent) => { const now = canvasPoint(moveEvent.clientX, moveEvent.clientY, canvasRect); const box = rectFromPoints(start, now); preview.style.left = `${box.x}px`; preview.style.top = `${box.y}px`; preview.style.width = `${box.w}px`; preview.style.height = `${box.h}px`; };
-    const up = (upEvent) => { const now = canvasPoint(upEvent.clientX, upEvent.clientY, canvasRect); const box = rectFromPoints(start, now); preview.remove(); if (box.w > 8 && box.h > 8) { pushHistory(); if (state.tool === "draw") { const source = currentImage(); const region = { id: `manual-${Date.now()}`, label: "手动分区", kind: "other", x: box.x / 760 * 100, y: 0, w: box.w / 760 * 100, h: 20, confidence: 1, group: nextGroup(), description: "人工创建的裁剪区域", layoutX: box.x, layoutY: box.y, layoutW: box.w, layoutH: box.h, userMoved: true }; source.regions.push(region); state.selectedRegionId = region.id; region.cropSrc = null; } else { state.layoutWhiteRects.push(box); } render(); } window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
-    window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
-  }
+  if (state.tool !== "select") { showToast("请在现有内容块上操作：分区会抠出多边形，涂白/覆盖只作用于该块", "warn"); return; }
+  event.preventDefault();
+  const canvasRect = $("#outputCanvas").getBoundingClientRect(), start = canvasPoint(event.clientX, event.clientY, canvasRect);
+  const marquee = document.createElement("div"); marquee.className = "selection-marquee"; $("#regionLayer").appendChild(marquee);
+  const move = (moveEvent) => {
+    const now = canvasPoint(moveEvent.clientX, moveEvent.clientY, canvasRect), rect = rectFromPoints(start, now);
+    Object.assign(marquee.style, { left: `${rect.x}px`, top: `${rect.y}px`, width: `${rect.w}px`, height: `${rect.h}px` });
+  };
+  const up = (upEvent) => {
+    const now = canvasPoint(upEvent.clientX, upEvent.clientY, canvasRect), rect = rectFromPoints(start, now); marquee.remove();
+    const entries = rect.w < 4 && rect.h < 4 ? [] : $$(".region-tile").filter((tile) => {
+      const left = Number.parseFloat(tile.style.left), top = Number.parseFloat(tile.style.top), width = Number.parseFloat(tile.style.width), height = Number.parseFloat(tile.style.height);
+      return left < rect.x + rect.w && left + width > rect.x && top < rect.y + rect.h && top + height > rect.y;
+    }).map((tile) => ({ image: state.images.find((item) => item.id === tile.dataset.imageId), region: state.images.find((item) => item.id === tile.dataset.imageId)?.regions.find((item) => item.id === tile.dataset.regionId) })).filter((item) => item.image && item.region);
+    setSelection(entries); renderRegions(); renderInspector();
+    window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+  };
+  window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
 }
 
-function startBrushStroke(event) {
-  if (state.tool !== "brush" || !currentImage()) return;
-  event.preventDefault();
-  const rect = $("#outputCanvas").getBoundingClientRect();
-  const path = { size: 8, points: [canvasPoint(event.clientX, event.clientY, rect)] };
-  state.layoutPaintPaths.push(path);
-  const move = (moveEvent) => { path.points.push(canvasPoint(moveEvent.clientX, moveEvent.clientY, rect)); drawPaint(); };
-  const up = () => { pushHistory(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+function tilePoint(event, box, allowOutside = false) {
+  const rect = box.getBoundingClientRect();
+  const x = (event.clientX - rect.left) / rect.width * 100, y = (event.clientY - rect.top) / rect.height * 100;
+  return allowOutside ? [clamp(x, -10000, 10000), clamp(y, -10000, 10000)] : [clamp(x, 0, 100), clamp(y, 0, 100)];
+}
+
+function createTilePreview(box, kind) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.classList.add("tile-draw-preview"); svg.setAttribute("viewBox", "0 0 100 100"); svg.dataset.previewKind = kind;
+  box.appendChild(svg); return svg;
+}
+
+function startPolygonCut(event, box, { image, region }) {
+  const points = [tilePoint(event, box, true)], svg = createTilePreview(box, "polygon");
+  const underlay = document.createElementNS(svg.namespaceURI, "polyline"), shape = document.createElementNS(svg.namespaceURI, "polyline");
+  underlay.classList.add("draw-preview-underlay"); shape.classList.add("draw-preview-line");
+  svg.append(underlay, shape);
+  const updatePreview = () => { const value = points.map((point) => point.join(",")).join(" "); underlay.setAttribute("points", value); shape.setAttribute("points", value); };
+  updatePreview();
+  const move = (moveEvent) => {
+    const next = tilePoint(moveEvent, box, true), last = points[points.length - 1];
+    if (Math.hypot(next[0] - last[0], next[1] - last[1]) < 1.2) return;
+    points.push(next); updatePreview();
+  };
+  const up = (upEvent) => {
+    const finalPoint = tilePoint(upEvent, box, true), last = points[points.length - 1];
+    if (Math.hypot(finalPoint[0] - last[0], finalPoint[1] - last[1]) > .1) points.push(finalPoint);
+    svg.remove(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+    const raw = points.filter((point, index) => !index || Math.hypot(point[0] - points[index - 1][0], point[1] - points[index - 1][1]) > .15);
+    const tileClipped = clipPolygonToTile(raw);
+    if (tileClipped.length < 3 || polygonSelfIntersects(tileClipped)) return showToast("分区轨迹无法形成有效多边形，请重新绘制", "warn");
+    const parentPolygon = regionPolygon(region).map(([x, y]) => [((Number(x) - Number(region.x)) / Number(region.w)) * 100, ((Number(y) - Number(region.y)) / Number(region.h)) * 100]);
+    const clippedParts = intersectSimplePolygons(tileClipped, parentPolygon);
+    if (!clippedParts.length) return showToast("绘制区域与当前模型多边形没有交集", "warn");
+    const polygons = clippedParts.map((part) => part.map(([x, y]) => [+(Number(region.x) + x * Number(region.w) / 100).toFixed(3), +(Number(region.y) + y * Number(region.h) / 100).toFixed(3)]));
+    if (polygons.some((polygon) => polygonArea(polygon) < .001 || polygonSelfIntersects(polygon))) return showToast("分区轨迹无法形成有效多边形，请重新绘制", "warn");
+    pushHistory();
+    const children = polygons.map((polygon) => makeManualPolygonRegion(image, region, polygon, "手动抠出"));
+    region.holes = [...(region.holes || []), ...polygons.map((polygon) => ({ polygon }))]; region.cropSrc = null;
+    image.regions.push(...children); setSelection(children.map((child) => ({ image, region: child }))); render();
+    showToast(`多边形内容已从原块抠出为 ${children.length} 块；超出部分已沿模型边缘闭合`, "success");
+  };
   window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
+}
+
+function clipPolygonToTile(points) {
+  let output = points.map(([x, y]) => [x, y]);
+  const edges = [
+    { inside: ([x]) => x >= 0, intersect: (a, b) => [0, a[1] + (b[1] - a[1]) * (0 - a[0]) / ((b[0] - a[0]) || 1e-12)] },
+    { inside: ([x]) => x <= 100, intersect: (a, b) => [100, a[1] + (b[1] - a[1]) * (100 - a[0]) / ((b[0] - a[0]) || 1e-12)] },
+    { inside: ([, y]) => y >= 0, intersect: (a, b) => [a[0] + (b[0] - a[0]) * (0 - a[1]) / ((b[1] - a[1]) || 1e-12), 0] },
+    { inside: ([, y]) => y <= 100, intersect: (a, b) => [a[0] + (b[0] - a[0]) * (100 - a[1]) / ((b[1] - a[1]) || 1e-12), 100] },
+  ];
+  for (const edge of edges) {
+    if (!output.length) break;
+    const input = output; output = [];
+    let previous = input[input.length - 1], previousInside = edge.inside(previous);
+    for (const current of input) {
+      const currentInside = edge.inside(current);
+      if (currentInside) {
+        if (!previousInside) output.push(edge.intersect(previous, current));
+        output.push(current);
+      } else if (previousInside) output.push(edge.intersect(previous, current));
+      previous = current; previousInside = currentInside;
+    }
+  }
+  const compact = output.filter((point, index) => !index || Math.hypot(point[0] - output[index - 1][0], point[1] - output[index - 1][1]) > .15);
+  if (compact.length > 2 && Math.hypot(compact[0][0] - compact[compact.length - 1][0], compact[0][1] - compact[compact.length - 1][1]) < .15) compact.pop();
+  return compact;
+}
+
+function intersectSimplePolygons(subject, clip) {
+  if (subject.length < 3 || clip.length < 3 || polygonSelfIntersects(subject) || polygonSelfIntersects(clip)) return [];
+  const splits = (polygon) => polygon.map((point, index) => [{ t: 0, point }, { t: 1, point: polygon[(index + 1) % polygon.length] }]);
+  const subjectSplits = splits(subject), clipSplits = splits(clip);
+  const cross = (a, b) => a[0] * b[1] - a[1] * b[0];
+  for (let i = 0; i < subject.length; i++) {
+    const a = subject[i], b = subject[(i + 1) % subject.length], r = [b[0] - a[0], b[1] - a[1]];
+    for (let j = 0; j < clip.length; j++) {
+      const c = clip[j], d = clip[(j + 1) % clip.length], s = [d[0] - c[0], d[1] - c[1]];
+      const denominator = cross(r, s);
+      if (Math.abs(denominator) < 1e-9) continue;
+      const offset = [c[0] - a[0], c[1] - a[1]], t = cross(offset, s) / denominator, u = cross(offset, r) / denominator;
+      if (t < -1e-8 || t > 1 + 1e-8 || u < -1e-8 || u > 1 + 1e-8) continue;
+      const boundedT = clamp(t, 0, 1), point = [a[0] + r[0] * boundedT, a[1] + r[1] * boundedT];
+      subjectSplits[i].push({ t: boundedT, point }); clipSplits[j].push({ t: clamp(u, 0, 1), point });
+    }
+  }
+  const pointInOrOn = (point, polygon) => {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const a = polygon[j], b = polygon[i], edge = [b[0] - a[0], b[1] - a[1]], offset = [point[0] - a[0], point[1] - a[1]];
+      if (Math.abs(cross(edge, offset)) < 1e-7 && point[0] >= Math.min(a[0], b[0]) - 1e-7 && point[0] <= Math.max(a[0], b[0]) + 1e-7 && point[1] >= Math.min(a[1], b[1]) - 1e-7 && point[1] <= Math.max(a[1], b[1]) + 1e-7) return true;
+      if ((a[1] > point[1]) !== (b[1] > point[1]) && point[0] < (b[0] - a[0]) * (point[1] - a[1]) / ((b[1] - a[1]) || 1e-12) + a[0]) inside = !inside;
+    }
+    return inside;
+  };
+  const keyOf = ([x, y]) => `${Math.round(x * 1e6)},${Math.round(y * 1e6)}`;
+  const coordinates = new Map(), adjacency = new Map(), edges = new Set();
+  const addEdge = (a, b) => {
+    const from = keyOf(a), to = keyOf(b); if (from === to) return;
+    coordinates.set(from, a); coordinates.set(to, b);
+    const key = from < to ? `${from}|${to}` : `${to}|${from}`;
+    if (edges.has(key)) return;
+    edges.add(key);
+    if (!adjacency.has(from)) adjacency.set(from, new Set());
+    if (!adjacency.has(to)) adjacency.set(to, new Set());
+    adjacency.get(from).add(to); adjacency.get(to).add(from);
+  };
+  const addContainedBoundary = (polygon, edgeSplits, other) => {
+    for (let index = 0; index < polygon.length; index++) {
+      const nodes = edgeSplits[index].sort((a, b) => a.t - b.t).filter((item, nodeIndex, all) => !nodeIndex || Math.abs(item.t - all[nodeIndex - 1].t) > 1e-8);
+      for (let node = 0; node < nodes.length - 1; node++) {
+        const a = nodes[node].point, b = nodes[node + 1].point, midpoint = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+        if (pointInOrOn(midpoint, other)) addEdge(a, b);
+      }
+    }
+  };
+  addContainedBoundary(subject, subjectSplits, clip);
+  addContainedBoundary(clip, clipSplits, subject);
+
+  const used = new Set(), result = [];
+  for (const firstEdge of edges) {
+    if (used.has(firstEdge)) continue;
+    const [start, first] = firstEdge.split("|");
+    let previous = start, current = first, path = [start], closed = false;
+    used.add(firstEdge);
+    for (let step = 0; step <= edges.size + 1; step++) {
+      if (current === start) { closed = true; break; }
+      path.push(current);
+      const options = [...(adjacency.get(current) || [])].filter((next) => {
+        const key = current < next ? `${current}|${next}` : `${next}|${current}`;
+        return !used.has(key);
+      });
+      if (!options.length) break;
+      let next = options.find((candidate) => candidate !== previous) || options[0];
+      const key = current < next ? `${current}|${next}` : `${next}|${current}`;
+      used.add(key); previous = current; current = next;
+    }
+    if (!closed || path.length < 3) continue;
+    const points = path.map((key) => coordinates.get(key));
+    if (!points.some((point) => !point) && polygonArea(points) > .001 && !polygonSelfIntersects(points)) result.push(points);
+  }
+  return result;
+}
+
+function startRegionCover(event, box, { region }) {
+  const start = tilePoint(event, box), svg = createTilePreview(box, "cover"), polygon = document.createElementNS(svg.namespaceURI, "polygon");
+  svg.appendChild(polygon);
+  const move = (moveEvent) => {
+    const end = tilePoint(moveEvent, box), pts = [[start[0], start[1]], [end[0], start[1]], [end[0], end[1]], [start[0], end[1]]];
+    polygon.setAttribute("points", pts.map((point) => point.join(",")).join(" "));
+  };
+  const up = (upEvent) => {
+    const end = tilePoint(upEvent, box); svg.remove(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+    if (Math.abs(end[0] - start[0]) < 1 || Math.abs(end[1] - start[1]) < 1) return;
+    pushHistory(); region.whiteoutPolygons = region.whiteoutPolygons || [];
+    region.whiteoutPolygons.push([[start[0], start[1]], [end[0], start[1]], [end[0], end[1]], [start[0], end[1]]]);
+    region.cropSrc = null; render(); showToast("矩形覆盖已应用到选中内容块", "success");
+  };
+  window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
+}
+
+function startRegionBrush(event, box, { region }) {
+  const points = [tilePoint(event, box)], rect = box.getBoundingClientRect(), svg = createTilePreview(box, "brush"), line = document.createElementNS(svg.namespaceURI, "polyline");
+  line.setAttribute("stroke", "#fff"); line.setAttribute("stroke-width", String(Math.max(.6, 8 / rect.width * 100))); line.setAttribute("stroke-linecap", "round"); line.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(line); line.setAttribute("points", `${points[0][0]},${points[0][1]}`);
+  const move = (moveEvent) => {
+    const next = tilePoint(moveEvent, box), last = points[points.length - 1];
+    if (Math.hypot(next[0] - last[0], next[1] - last[1]) < .5) return;
+    points.push(next); line.setAttribute("points", points.map((point) => point.join(",")).join(" "));
+  };
+  const up = () => {
+    svg.remove(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+    pushHistory(); region.whiteoutPaths = region.whiteoutPaths || [];
+    region.whiteoutPaths.push({ points, width: Math.max(.6, 8 / rect.width * 100) }); region.cropSrc = null;
+    render(); showToast("画笔涂白已应用到选中内容块", "success");
+  };
+  window.addEventListener("pointermove", move); window.addEventListener("pointerup", up, { once: true });
+}
+
+function makeManualPolygonRegion(image, parent, polygon, label) {
+  const xs = polygon.map(([x]) => x), ys = polygon.map(([, y]) => y);
+  const x = Math.min(...xs), y = Math.min(...ys), w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+  const imageScale = image.displayScale || Math.min(1, 760 / Math.max(1, image.sourceWidth || 760));
+  const layoutW = Math.max(1, (image.sourceWidth || 760) * w / 100 * imageScale), layoutH = Math.max(1, (image.sourceHeight || 1000) * h / 100 * imageScale);
+  const relX = (x - parent.x) / parent.w, relY = (y - parent.y) / parent.h;
+  return { id: `manual-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, label, kind: parent.kind, x, y, w, h, polygon, holes: structuredClone(parent.holes || []), group: parent.group, description: "从原内容块手工抠出的多边形区域", confidence: 1, cropSrc: null, layoutX: parent.layoutX + relX * parent.layoutW, layoutY: parent.layoutY + relY * parent.layoutH, layoutW, layoutH, homeLayoutX: (parent.homeLayoutX ?? parent.layoutX) + relX * parent.layoutW, homeLayoutY: (parent.homeLayoutY ?? 0) + relY * parent.layoutH, userMoved: true };
 }
 
 function canvasPoint(clientX, clientY, rect) { const scale = state.zoom || 1; return { x: Math.max(0, (clientX - rect.left) / scale), y: Math.max(0, (clientY - rect.top) / scale) }; }
@@ -343,6 +840,9 @@ function formatBytes(bytes) { if (bytes < 1024 * 1024) return `${Math.max(1, Mat
 
 function applyAnalysisResult(image, result) {
   pushHistory();
+  delete image.syntheticRegion;
+  delete image.homePageHeight;
+  delete image.layoutPageY;
   image.regions = (result.regions || []).map((region, index) => ({ ...region, id: region.id || `region-${Date.now()}-${index}`, cropSrc: null, layoutX: null, layoutY: null, layoutW: null, layoutH: null, userMoved: false }));
   image.previewReady = false;
   image.analyzed = true;
@@ -351,7 +851,7 @@ function applyAnalysisResult(image, result) {
   image.supervisionUserEdited = false;
   state.lastAnalyzed = "刚刚";
   state.lastSupervision = result.supervision || null;
-  if (state.currentId === image.id) state.selectedRegionId = image.regions[0]?.id || null;
+  if (state.currentId === image.id) setSelection(image.regions[0] ? [{ image, region: image.regions[0] }] : []);
   render();
 }
 
@@ -480,6 +980,34 @@ async function segmentSelectedRegion() {
   }
 }
 
+async function reanalyzeSelectedRegion() {
+  const image = currentImage(), region = selectedRegion();
+  if (!image || !region || region.synthetic) return showToast("请先选择一个可重分析的内容块", "warn");
+  if (!image.src.startsWith("data:image/")) return showToast("原位重分析需要图片素材，请重新导入该图片", "warn");
+  const button = $("#reanalyzeRegionButton"), previousLabel = button.textContent;
+  const originalPolygon = regionPolygon(region).map(([x, y]) => [Number(x), Number(y)]);
+  const geometryKey = JSON.stringify({ polygon: originalPolygon, holes: region.holes || [] });
+  button.disabled = true; button.textContent = "正在独立重分析…";
+  setProcessingStatus("正在把原图和当前多边形边界发送给重分析 agent…");
+  try {
+    const response = await fetch("/api/reanalyze-region", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: image.src, polygon: originalPolygon, label: region.label, kind: region.kind, group: region.group, description: region.description || "", editAction: region.editAction || "keep", holes: region.holes || [] }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "原位重分析失败");
+    const liveRegion = image.regions.find((item) => item.id === region.id);
+    if (!liveRegion || JSON.stringify({ polygon: regionPolygon(liveRegion), holes: liveRegion.holes || [] }) !== geometryKey) throw new Error("分析期间分区已更改，未应用重分析结果");
+    pushHistory();
+    if (!setRegionPolygon(image, liveRegion, result.polygon)) throw new Error("模型返回的多边形无效，原分区保持不变");
+    liveRegion.cropSrc = null;
+    setProcessingStatus("当前内容块已完成独立重分析");
+    render(); showToast("已按当前原图重新分析并更新该块的多边形边界", "success");
+  } catch (error) {
+    setProcessingStatus("原位重分析未更改分区"); showToast(error.message || "原位重分析失败", "error");
+  } finally { button.disabled = false; button.textContent = previousLabel; }
+}
+
 async function segmentAll() {
   const candidates = state.images.filter((image) => image.src.startsWith("data:image/") && !image.analyzed);
   if (!candidates.length) return showToast("队列中的图片都已分析，可继续人工调整", "warn");
@@ -517,17 +1045,28 @@ async function importWebpage() {
 }
 
 function resizePaintCanvas() { const canvas = $("#paintLayer"); const frame = $("#outputCanvas"); if (!frame || !frame.clientWidth) return; const ratio = window.devicePixelRatio || 1; canvas.width = Math.round(frame.clientWidth * ratio); canvas.height = Math.round(frame.clientHeight * ratio); canvas.style.width = `${frame.clientWidth}px`; canvas.style.height = `${frame.clientHeight}px`; }
-function drawPaint() {
-  const canvas = $("#paintLayer"); if (!canvas.width) return; const ctx = canvas.getContext("2d"); const scale = window.devicePixelRatio || 1; ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.save(); ctx.scale(scale, scale);
-  state.layoutWhiteRects.forEach((item) => { ctx.fillStyle = "rgba(255,255,255,.98)"; ctx.fillRect(item.x, item.y, item.w, item.h); });
-  state.layoutPaintPaths.forEach((path) => { if (path.points.length < 1) return; ctx.strokeStyle = "rgba(255,255,255,.98)"; ctx.lineWidth = path.size; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.beginPath(); path.points.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y)); ctx.stroke(); });
-  ctx.restore();
-}
+function drawPaint() { const canvas = $("#paintLayer"); if (!canvas.width) return; canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height); }
 
-function clearWhiteouts() { const image = currentImage(); if (!image) return; pushHistory(); state.whiteRects[image.id] = []; state.paintPaths[image.id] = []; state.layoutWhiteRects = []; state.layoutPaintPaths = []; renderRegions(); drawPaint(); showToast("已清除当前画布的涂白", "success"); }
-function deleteImage(imageId) { const index = state.images.findIndex((image) => image.id === imageId); if (index < 0) return; pushHistory(); state.images.splice(index, 1); delete state.whiteRects[imageId]; delete state.paintPaths[imageId]; if (state.currentId === imageId) { const next = state.images[Math.min(index, state.images.length - 1)]; state.currentId = next?.id || null; state.selectedRegionId = next?.regions[0]?.id || null; } render(); showToast("素材图片已删除", "success"); }
-function deleteRegion(imageId, regionId) { const image = state.images.find((item) => item.id === imageId); if (!image) return; const region = image.regions.find((item) => item.id === regionId); if (!region) return; pushHistory(); image.regions = image.regions.filter((item) => item.id !== regionId); if (state.currentId === imageId && state.selectedRegionId === regionId) state.selectedRegionId = image.regions[0]?.id || null; render(); showToast("内容块已移除", "success"); }
-function deleteSelected() { const image = currentImage(); if (!image || !state.selectedRegionId) return showToast("请先选择一个内容块", "warn"); deleteRegion(image.id, state.selectedRegionId); }
+function clearWhiteouts() {
+  const entries = selectedRegionEntries();
+  if (entries.length !== 1) return showToast("请先单选一个要清除涂白的内容块", "warn");
+  const { region } = entries[0];
+  if (!(region.whiteoutPaths?.length || region.whiteoutPolygons?.length)) return showToast("当前内容块没有涂白或覆盖", "warn");
+  pushHistory(); region.whiteoutPaths = []; region.whiteoutPolygons = []; region.cropSrc = null; render(); showToast("已清除当前内容块内的涂白", "success");
+}
+function deleteImage(imageId) {
+  const index = state.images.findIndex((image) => image.id === imageId); if (index < 0) return;
+  pushHistory(); state.images.splice(index, 1); delete state.whiteRects[imageId]; delete state.paintPaths[imageId];
+  state.selectedRegionKeys = (state.selectedRegionKeys || []).filter((key) => !key.startsWith(`${imageId}::`));
+  if (state.currentId === imageId) { const next = state.images[Math.min(index, state.images.length - 1)]; state.currentId = next?.id || null; state.selectedRegionId = next?.regions[0]?.id || null; state.selectedRegionKeys = next?.regions[0] ? [regionKey(next.id, next.regions[0].id)] : []; }
+  render(); showToast("素材图片已删除", "success");
+}
+function deleteRegion(imageId, regionId) { const image = state.images.find((item) => item.id === imageId); if (!image) return; const region = image.regions.find((item) => item.id === regionId); if (!region) return; image.regions = image.regions.filter((item) => item.id !== regionId); }
+function deleteSelected() {
+  const entries = selectedRegionEntries(); if (!entries.length) return showToast("请先选择一个内容块", "warn");
+  pushHistory(); entries.forEach(({ image, region }) => deleteRegion(image.id, region.id));
+  setSelection([]); render(); showToast(`已移除 ${entries.length} 个内容块`, "success");
+}
 
 function saveProject() { const images = state.images.map((image) => ({ ...image, regions: image.regions.map(({ cropSrc, ...region }) => region), syntheticRegion: image.syntheticRegion ? (({ cropSrc, ...region }) => region)(image.syntheticRegion) : undefined })); const data = { version: 2, projectName: state.projectName, images, whiteRects: state.whiteRects, paintPaths: state.paintPaths, layoutWhiteRects: state.layoutWhiteRects, layoutPaintPaths: state.layoutPaintPaths, exportedAt: new Date().toISOString() }; const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${state.projectName || "draft-reformat"}.draft.json`; link.click(); URL.revokeObjectURL(link.href); showToast("项目 JSON 已保存", "success"); }
 
@@ -582,29 +1121,24 @@ async function buildExportHtml() {
   const size = $("#pageSize").value;
   const dimensions = { a4: [794, 1123], a3: [1123, 1587], letter: [816, 1056] };
   const [pageWidth, pageHeight] = dimensions[size] || dimensions.a4;
+  const pageMargin = clamp(Number($("#pageMargin").value), 0, Math.floor(Math.min(pageWidth, pageHeight) / 2));
   const pagesHtml = pageGroups.map((items) => {
     const groupTop = Math.min(...items.map((item) => item.region.layoutY || 0));
     const groupBottom = Math.max(...items.map((item) => (item.region.layoutY || groupTop) + (item.region.layoutH || 1)));
-    const groupHeight = Math.max(1, groupBottom - groupTop + 4);
+    const groupLeft = Math.min(...items.map((item) => Number.isFinite(item.region.layoutX) ? item.region.layoutX : 28));
+    const groupRight = Math.max(...items.map((item) => (Number.isFinite(item.region.layoutX) ? item.region.layoutX : 28) + (item.region.layoutW || 1)));
+    const contentWidth = Math.max(1, groupRight - groupLeft), contentHeight = Math.max(1, groupBottom - groupTop);
+    const pageScale = Math.min(1, (pageWidth - pageMargin * 2) / contentWidth, (pageHeight - pageMargin * 2) / contentHeight);
+    const groupHeight = Math.max(1, contentHeight * pageScale + pageMargin * 2);
     const blocksHtml = items.map((item) => {
       const region = item.region;
-      const left = Math.max(0, Math.round(Number.isFinite(region.layoutX) ? region.layoutX : 28));
-      const top = Math.max(0, Math.round((Number.isFinite(region.layoutY) ? region.layoutY : groupTop) - groupTop));
-      const width = Math.max(1, Math.round(Number.isFinite(region.layoutW) ? region.layoutW : 1));
-      const height = Math.max(1, Math.round(Number.isFinite(region.layoutH) ? region.layoutH : 1));
+      const left = Math.max(0, Math.round(((Number.isFinite(region.layoutX) ? region.layoutX : 28) - groupLeft) * pageScale + pageMargin));
+      const top = Math.max(0, Math.round(((Number.isFinite(region.layoutY) ? region.layoutY : groupTop) - groupTop) * pageScale + pageMargin));
+      const width = Math.max(1, Math.round((Number.isFinite(region.layoutW) ? region.layoutW : 1) * pageScale));
+      const height = Math.max(1, Math.round((Number.isFinite(region.layoutH) ? region.layoutH : 1) * pageScale));
       return '<article class="print-block" style="left:' + left + 'px;top:' + top + 'px;width:' + width + 'px;height:' + height + 'px"><img src="' + escapeHtml(item.src) + '" alt="' + escapeHtml(region.label || '') + '" style="width:' + width + 'px;height:' + height + 'px" /></article>';
     }).join('');
-    const whiteouts = state.layoutWhiteRects.map((rect) => {
-      const left = Number(rect.x) || 0;
-      const top = (Number(rect.y) || 0) - groupTop;
-      return '<div class="print-whiteout" style="left:' + left + 'px;top:' + top + 'px;width:' + Math.max(0, Number(rect.w) || 0) + 'px;height:' + Math.max(0, Number(rect.h) || 0) + 'px"></div>';
-    }).join('');
-    const brushPaths = state.layoutPaintPaths.map((path) => {
-      const points = (path.points || []).map((point) => `${Number(point.x) || 0},${(Number(point.y) || 0) - groupTop}`).join(' ');
-      return points ? '<polyline points="' + points + '" />' : '';
-    }).join('');
-    const overlay = (whiteouts || brushPaths) ? '<div class="print-overlays">' + whiteouts + '</div><svg class="print-brush-overlays" width="' + pageWidth + '" height="' + groupHeight + '" viewBox="0 0 ' + pageWidth + ' ' + groupHeight + '">' + brushPaths + '</svg>' : '';
-    return '<section class="print-page"><div class="print-group" data-group="' + escapeHtml(items[0].group) + '" style="height:' + groupHeight + 'px">' + blocksHtml + overlay + '</div></section>';
+    return '<section class="print-page"><div class="print-group" data-group="' + escapeHtml(items[0].group) + '" style="height:' + groupHeight + 'px">' + blocksHtml + '</div></section>';
   }).join('');
   setProcessingStatus("正在打开纯内容 PDF 预览（" + pageGroups.length + " 页）…");
   const css = '@page{size:' + size + ' portrait;margin:0}' +
@@ -689,26 +1223,20 @@ function drawCropHole(ctx, hole, region, width, height) {
 }
 
 function drawCropWhiteouts(ctx, image, region, width, height) {
-  (state.whiteRects[image.id] || []).forEach((item) => {
-    const x = (item.x - region.x) / region.w * width;
-    const y = (item.y - region.y) / region.h * height;
-    const w = item.w / region.w * width;
-    const h = item.h / region.h * height;
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(x, y, w, h);
+  (region.whiteoutPolygons || []).forEach((polygon) => {
+    if (!Array.isArray(polygon) || polygon.length < 3) return;
+    ctx.fillStyle = "#fff"; ctx.beginPath();
+    polygon.forEach(([x, y], index) => index ? ctx.lineTo(Number(x) / 100 * width, Number(y) / 100 * height) : ctx.moveTo(Number(x) / 100 * width, Number(y) / 100 * height));
+    ctx.closePath(); ctx.fill();
   });
-  (state.paintPaths[image.id] || []).forEach((path) => {
+  (region.whiteoutPaths || []).forEach((path) => {
     if (!path.points?.length) return;
     ctx.strokeStyle = "#fff";
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    ctx.lineWidth = (path.size || 8) / region.w * width;
+    ctx.lineWidth = Math.max(1, (Number(path.width) || 1) / 100 * width);
     ctx.beginPath();
-    path.points.forEach((point, index) => {
-      const x = (point.x - region.x) / region.w * width;
-      const y = (point.y - region.y) / region.h * height;
-      index ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    });
+    path.points.forEach(([x, y], index) => index ? ctx.lineTo(Number(x) / 100 * width, Number(y) / 100 * height) : ctx.moveTo(Number(x) / 100 * width, Number(y) / 100 * height));
     ctx.stroke();
   });
 }

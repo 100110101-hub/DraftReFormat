@@ -329,6 +329,23 @@ def make_supervision_images(image_data_url: str, proposal: list[dict[str, Any]])
         raise RuntimeError(f"Unable to create supervision boundary images: {exc}") from exc
 
 
+def make_region_reanalysis_images(image_data_url: str, region: dict[str, Any]) -> tuple[list[str], bool]:
+    """Best-effort boundary overlay for a one-region reanalysis request.
+
+    Pillow is optional for running the editor. If it is unavailable (or the
+    image format cannot be rendered), send the original image and let the
+    prompt's exact polygon coordinates serve as the reference instead.
+    """
+
+    if Image is None:
+        return [image_data_url], False
+    try:
+        return make_supervision_images(image_data_url, [region]), True
+    except Exception as exc:
+        print(f"Reanalysis boundary overlay skipped: {exc}")
+        return [image_data_url], False
+
+
 def qwen_request(
     model_image: str | list[str],
     prompt: str,
@@ -439,6 +456,108 @@ FIELD CONSTRAINTS
 - holes is optional; each hole is an object containing a required polygon of at least three absolute original-image [x,y] percentage points. Never use rectangular coordinates for a hole.
 - If a field is not applicable, omit it entirely. Never emit null, empty strings, empty arrays, confidence, color, rotation, or any other extra field.
 - The response must start with { and end with }, with zero whitespace outside the JSON. Use double quotes, valid UTF-8, and no trailing commas."""
+
+
+def polygon_area(points: list[list[float]]) -> float:
+    return abs(sum(
+        float(points[index][0]) * float(points[(index + 1) % len(points)][1])
+        - float(points[(index + 1) % len(points)][0]) * float(points[index][1])
+        for index in range(len(points))
+    )) / 2
+
+
+def _point_on_segment(point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]) -> bool:
+    cross = (point[0] - start[0]) * (end[1] - start[1]) - (point[1] - start[1]) * (end[0] - start[0])
+    return (
+        abs(cross) < 1e-7
+        and min(start[0], end[0]) - 1e-7 <= point[0] <= max(start[0], end[0]) + 1e-7
+        and min(start[1], end[1]) - 1e-7 <= point[1] <= max(start[1], end[1]) + 1e-7
+    )
+
+
+def _point_in_polygon(point: tuple[float, float], polygon: list[list[float]]) -> bool:
+    inside = False
+    for index, raw_start in enumerate(polygon):
+        raw_end = polygon[(index + 1) % len(polygon)]
+        start = (float(raw_start[0]), float(raw_start[1]))
+        end = (float(raw_end[0]), float(raw_end[1]))
+        if _point_on_segment(point, start, end):
+            return True
+        if (start[1] > point[1]) != (end[1] > point[1]):
+            crossing_x = (end[0] - start[0]) * (point[1] - start[1]) / (end[1] - start[1]) + start[0]
+            if point[0] < crossing_x:
+                inside = not inside
+    return inside
+
+
+def _segments_intersect(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float], d: tuple[float, float]) -> bool:
+    def orientation(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> float:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    o1, o2, o3, o4 = orientation(a, b, c), orientation(a, b, d), orientation(c, d, a), orientation(c, d, b)
+    if o1 * o2 < -1e-9 and o3 * o4 < -1e-9:
+        return True
+    return (
+        (abs(o1) < 1e-9 and _point_on_segment(c, a, b))
+        or (abs(o2) < 1e-9 and _point_on_segment(d, a, b))
+        or (abs(o3) < 1e-9 and _point_on_segment(a, c, d))
+        or (abs(o4) < 1e-9 and _point_on_segment(b, c, d))
+    )
+
+
+def polygon_self_intersects(polygon: list[list[float]]) -> bool:
+    for first in range(len(polygon)):
+        a = (float(polygon[first][0]), float(polygon[first][1]))
+        b_raw = polygon[(first + 1) % len(polygon)]
+        b = (float(b_raw[0]), float(b_raw[1]))
+        for second in range(first + 1, len(polygon)):
+            if second == (first + 1) % len(polygon) or first == (second + 1) % len(polygon):
+                continue
+            c_raw, d_raw = polygon[second], polygon[(second + 1) % len(polygon)]
+            c, d = (float(c_raw[0]), float(c_raw[1])), (float(d_raw[0]), float(d_raw[1]))
+            if _segments_intersect(a, b, c, d):
+                return True
+    return False
+
+
+def validate_reanalyzed_polygon(candidate: Any) -> list[str]:
+    """Validate polygon-only geometry returned by the independent reanalysis."""
+
+    if not valid_polygon_points(candidate):
+        return ["The reanalyzed boundary must contain at least three valid percentage points"]
+    if polygon_self_intersects(candidate):
+        return ["The reanalyzed boundary must not self-intersect"]
+    if polygon_area(candidate) <= 1e-8:
+        return ["The reanalyzed boundary has no measurable area"]
+    return []
+
+
+def region_reanalysis_prompt(region: dict[str, Any], has_boundary_overlay: bool = True) -> str:
+    """Ask Qwen to independently reassess just one selected semantic region."""
+
+    image_note = (
+        "The current region boundary is also drawn over the supplied original image(s)."
+        if has_boundary_overlay
+        else "No image overlay could be rendered; use the exact current polygon coordinates below as the reference boundary."
+    )
+    return """You are a document and scientific-image region reanalysis agent. Independently reanalyze ONLY the one selected semantic region described below. This is not page segmentation and not a request to split the region into children. Return one corrected polygon for the same semantic object/block, keeping its identity and meaning.
+
+INPUT
+The supplied raster is the ORIGINAL uncropped image. """ + image_note + """ Coordinate axes, if present, are an external aid and are not source content. The selected region's existing polygon is given in exact source-image percentage coordinates below.
+
+TASK
+Inspect the complete source around the marked region, then return the best polygon for this same semantic region. Reassess every edge independently: correct tight, clipped, or inaccurate edges and include the complete intended content with a modest white safety margin. The corrected polygon may change shape or size as needed; do not return unrelated neighboring content or split the region. Preserve its semantic group as one block.
+
+CHEMISTRY AND SCIENCE COMPLETENESS
+For chemical equations, mechanisms, and molecular structures, keep the complete connected expression together. Include every reactant, intermediate, product, atom label, bond endpoint, charge, isotope, sub/superscript, stereochemical mark, reagent/condition, curved electron-pushing arrow, reaction arrow, full arrow shaft and arrowhead, and detached label belonging to the same expression. Never crop or omit an arrow or its arrowhead. For biological diagrams and scientific figures, include all labels and meaningful edges.
+
+COORDINATES AND OUTPUT
+Use percentages of the original inner image: top-left (0,0), bottom-right (100,100). Return a polygon, never a rectangle or bbox. Use enough vertices to represent a non-rectangular outline. Return strict JSON only, with exactly one key:
+{"polygon":[[12.0,8.0],[30.0,7.0],[48.0,9.0],[45.0,28.0],[15.0,30.0]]}
+No x/y/w/h, no extra keys, no nulls, no markdown fences, no explanation.
+
+CURRENT REGION TO REANALYZE
+""" + json.dumps(region, ensure_ascii=False)
 
 
 def model_visible_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1104,6 +1223,46 @@ class Handler(BaseHTTPRequestHandler):
                     response["jobId"] = job_id
                     response["supervision"] = {**supervision, "jobId": job_id}
                 json_response(self, response)
+                return
+            if self.path == "/api/reanalyze-region":
+                image = str(payload.get("image", ""))
+                current_polygon = payload.get("polygon")
+                if not image.startswith("data:image/"):
+                    raise ValueError("需要一个图片 data URL")
+                if not valid_polygon_points(current_polygon) or polygon_area(current_polygon) <= 1e-8:
+                    raise ValueError("当前多边形无效或面积为零")
+                region = {
+                    "id": "selected-region",
+                    "label": str(payload.get("label") or "Selected region"),
+                    "kind": str(payload.get("kind") or "other"),
+                    "group": str(payload.get("group") or ""),
+                    "description": str(payload.get("description") or ""),
+                    "editAction": "delete" if payload.get("editAction") == "delete" else "keep",
+                    "polygon": current_polygon,
+                }
+                holes = payload.get("holes")
+                if isinstance(holes, list):
+                    region["holes"] = [
+                        {"polygon": hole["polygon"]}
+                        for hole in holes
+                        if isinstance(hole, dict) and valid_polygon_points(hole.get("polygon"))
+                    ]
+                review_images, has_boundary_overlay = make_region_reanalysis_images(image, region)
+                parsed, error = qwen_request(
+                    review_images,
+                    region_reanalysis_prompt(region, has_boundary_overlay=has_boundary_overlay),
+                )
+                if error:
+                    json_response(self, {"error": "原位重分析请求失败：" + error}, 502)
+                    return
+                if not isinstance(parsed, dict) or set(parsed) != {"polygon"}:
+                    json_response(self, {"error": "原位重分析返回格式无效；原分区保持不变"}, 502)
+                    return
+                issues = validate_reanalyzed_polygon(parsed.get("polygon"))
+                if issues:
+                    json_response(self, {"error": "原位重分析结果无效：" + issues[0]}, 422)
+                    return
+                json_response(self, {"polygon": parsed["polygon"], "model": QWEN_MODEL})
                 return
             if self.path == "/api/import-url":
                 result = import_url(str(payload.get("url", "")))

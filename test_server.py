@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import base64
+import json
+import threading
+import urllib.request
 import unittest
 from io import BytesIO
 from unittest.mock import patch
@@ -31,6 +34,66 @@ def valid_supervisor_payload() -> dict:
 
 
 class StructuredOutputTests(unittest.TestCase):
+    def test_reanalysis_endpoint_sends_boundary_overlay_and_accepts_corrected_polygon(self) -> None:
+        current = [[40, 40], [60, 40], [60, 60], [40, 60]]
+        corrected = [[41, 41], [58, 40], [59, 57], [43, 59]]
+        captured: dict = {}
+
+        def fake_request(images, prompt, *args, **kwargs):
+            captured["images"] = images
+            captured["prompt"] = prompt
+            return {"polygon": corrected}, None
+
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{httpd.server_port}/api/reanalyze-region",
+                data=json.dumps({"image": "data:image/png;base64,eA==", "polygon": current, "kind": "chemistry", "label": "Reaction", "description": "Reaction with arrows", "holes": [{"polygon": [[45, 45], [50, 45], [50, 50]]}]}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with (
+                patch("server.make_region_reanalysis_images", return_value=(["source-with-polygon", "coordinate-overlay"], True)),
+                patch("server.qwen_request", side_effect=fake_request),
+            ):
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    result = json.loads(response.read().decode())
+            self.assertEqual(result["polygon"], corrected)
+            self.assertEqual(captured["images"], ["source-with-polygon", "coordinate-overlay"])
+            self.assertIn("ONLY the one selected semantic region", captured["prompt"])
+            self.assertIn("not a request to split", captured["prompt"])
+            self.assertIn("reaction arrow", captured["prompt"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def test_reanalysis_accepts_same_or_smaller_valid_polygons(self) -> None:
+        current = [[40, 40], [60, 40], [60, 60], [40, 60]]
+        corrected = [[41, 41], [59, 41], [59, 59], [41, 59]]
+        self.assertEqual(server.validate_reanalyzed_polygon(current), [])
+        self.assertEqual(server.validate_reanalyzed_polygon(corrected), [])
+        self.assertTrue(server.validate_reanalyzed_polygon([[40, 40], [60, 60], [40, 60], [60, 40]]))
+
+    def test_reanalysis_prompt_shows_current_polygon_and_preserves_chemistry_arrows(self) -> None:
+        prompt = server.region_reanalysis_prompt({"polygon": [[10, 10], [20, 10], [20, 20]], "kind": "chemistry"})
+        self.assertIn("Independently reanalyze ONLY", prompt)
+        self.assertIn("CURRENT REGION TO REANALYZE", prompt)
+        self.assertIn("arrowhead", prompt)
+        self.assertIn('"polygon"', prompt)
+
+    def test_reanalysis_falls_back_to_original_image_without_pillow(self) -> None:
+        image = "data:image/png;base64,eA=="
+        with patch.object(server, "Image", None):
+            images, has_overlay = server.make_region_reanalysis_images(image, {"polygon": [[1, 1], [2, 1], [2, 2]]})
+        self.assertEqual(images, [image])
+        self.assertFalse(has_overlay)
+        prompt = server.region_reanalysis_prompt({"polygon": [[1, 1], [2, 1], [2, 2]]}, has_boundary_overlay=has_overlay)
+        self.assertIn("No image overlay could be rendered", prompt)
+        self.assertIn("exact current polygon coordinates", prompt)
+
     def test_all_chemistry_agents_require_complete_edges_and_safety_clearance(self) -> None:
         initial = server.segmentation_prompt()
         revision = server.segmentation_revision_prompt([], ["Expand clipped atom label"], [])

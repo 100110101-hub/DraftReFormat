@@ -51,7 +51,7 @@
             </section>
 
             <section class="side-section">
-              <div class="section-heading"><span>素材队列</span><button id="sortImages" class="text-button">按编号排序</button></div>
+              <div class="section-heading"><span>素材队列</span><div class="asset-sort-actions"><button id="sortImages" class="text-button">按编号排序</button><button id="sortImagesByName" class="text-button">按名称排序</button></div></div>
               <div class="asset-list" id="assetList"></div>
             </section>
           </div>
@@ -75,10 +75,12 @@
             <div class="stage-tools">
               <div class="tool-group">
                 <button class="tool-button active" data-tool="select" title="选择/拖动"><span>↖</span><em>选择</em></button>
-                <button class="tool-button" data-tool="draw" title="手动新增分区"><span>⌁</span><em>分区</em></button>
-                <button class="tool-button" data-tool="brush" title="画笔涂白"><span>✎</span><em>涂白</em></button>
-                <button class="tool-button" data-tool="cover" title="方形覆盖"><span>□</span><em>覆盖</em></button>
+                <button class="tool-button" data-tool="draw" title="在分区上描绘多边形，将内容从原块中抠出"><span>⬠</span><em>多边形分区</em></button>
+                <button class="tool-button" data-tool="brush" title="在选中的内容块内涂白"><span>✎</span><em>块内涂白</em></button>
+                <button class="tool-button" data-tool="cover" title="在选中的内容块内画矩形白色覆盖"><span>□</span><em>块内覆盖</em></button>
               </div>
+              <div class="divider"></div>
+              <button class="boundary-toggle active" id="boundaryLabelsToggle" type="button" aria-pressed="true" title="显示或隐藏模型多边形边界与顶点编号"><span>⬠</span><em>边界顶点</em></button>
               <div class="divider"></div>
               <button class="icon-button zoom-button" id="zoomOut">−</button><span class="zoom-label" id="zoomLabel">100%</span><button class="icon-button zoom-button" id="zoomIn">＋</button>
               <button class="icon-button" id="fitButton" title="适应窗口">⌗</button>
@@ -107,22 +109,22 @@
 
         <aside class="sidebar right-sidebar">
           <div class="inspector-header"><div><span class="eyebrow">INSPECTOR</span><h2>属性检查器</h2></div><button class="icon-button">•••</button></div>
-          <div class="inspector-scroll" id="inspector">
+          <div class="inspector-scroll inspector-panel" id="inspector">
+            <div class="multi-selection-summary" id="multiSelectionSummary" hidden><strong id="multiSelectionCount">0 个内容块已选中</strong><span>可一起拖动或删除。灰色属性只支持单块编辑。</span></div>
             <div class="no-selection" id="noSelection"><div class="no-selection-icon">⌁</div><strong>选择一个内容块</strong><span>拖动边界、修改标签或调整<br />编号集合归属</span></div>
             <div id="regionInspector" hidden>
-              <div class="selected-preview" id="selectedPreview"><span class="preview-type" id="previewType">TEXT</span><span class="preview-group" id="previewGroup">集合 01</span></div>
-              <div class="property-block"><label>语义标签</label><input id="regionLabel" type="text" /><div class="suggestion-row"><button data-label="正文说明">正文说明</button><button data-label="图表 / 图片">图表 / 图片</button><button data-label="化学结构式">化学结构式</button></div></div>
-              <div class="property-block"><label>内容类型</label><div class="select-like" id="kindSelect"><span id="regionKind">文字段落</span><span>⌄</span></div><div class="kind-menu" id="kindMenu"><button data-kind="text">文字段落</button><button data-kind="image">图片 / 插图</button><button data-kind="table">表格</button><button data-kind="chemistry">化学结构式</button><button data-kind="biology">生物图片</button><button data-kind="formula">数学公式</button></div></div>
-              <div class="property-block"><div class="label-with-value"><label>编号集合</label><span class="group-badge" id="groupBadge">A</span></div><div class="group-input-row"><input id="regionGroup" type="text" /><button id="newGroupButton">新建</button></div><p class="field-note">同一集合内的内容会在导出分页时保持完整。</p></div>
-              <button class="ai-run-button split-region-button" id="splitRegionButton">✦ 分析并细分此块（保留原位）</button><p class="field-note split-region-note">细分后保留全部内容及块内相对位置；空白随块拆分自然收拢，不会删除内容。</p>
-              <div class="property-block coordinates"><div class="label-with-value"><label>裁剪源位置</label><span class="field-note">原图百分比</span></div><div class="coord-grid"><label>X<input id="regionX" type="number" min="0" max="100" step="0.1" /></label><label>Y<input id="regionY" type="number" min="0" max="100" step="0.1" /></label><label>W<input id="regionW" type="number" min="1" max="100" step="0.1" /></label><label>H<input id="regionH" type="number" min="1" max="100" step="0.1" /></label></div></div>
-              <div class="property-block layer-controls"><div class="label-with-value"><label>图层顺序</label><span class="field-note">覆盖关系</span></div><div class="layer-buttons"><button id="layerBottom">置底</button><button id="layerDown">下移</button><button id="layerUp">上移</button><button id="layerTop">置顶</button></div></div>
-              <div class="confidence-block"><div class="confidence-heading"><span>AI 置信度</span><b id="confidenceValue">82%</b></div><div class="confidence-bar"><i id="confidenceBar"></i></div><span class="field-note" id="regionDescription">模型对该语义块的识别较为稳定</span></div>
+              <div class="selected-preview single-region-control" id="selectedPreview"><svg id="polygonPreview" viewBox="0 0 100 100" aria-label="当前分区多边形"><polygon points="10,10 90,10 90,90 10,90"></polygon></svg><span class="preview-type" id="previewType">TEXT</span><span class="preview-group" id="previewGroup">集合 01</span></div>
+              <div class="property-block single-region-control"><label>语义标签</label><input id="regionLabel" type="text" /><div class="suggestion-row"><button data-label="正文说明">正文说明</button><button data-label="图表 / 图片">图表 / 图片</button><button data-label="化学结构式">化学结构式</button></div></div>
+              <div class="property-block single-region-control"><label>内容类型</label><div class="select-like" id="kindSelect"><span id="regionKind">文字段落</span><span>⌄</span></div><div class="kind-menu" id="kindMenu"><button data-kind="text">文字段落</button><button data-kind="image">图片 / 插图</button><button data-kind="table">表格</button><button data-kind="chemistry">化学结构式</button><button data-kind="biology">生物图片</button><button data-kind="formula">数学公式</button></div></div>
+              <div class="property-block single-region-control"><div class="label-with-value"><label>编号集合</label><span class="group-badge" id="groupBadge">A</span></div><div class="group-input-row"><input id="regionGroup" type="text" /><button id="newGroupButton">新建</button></div><p class="field-note">同一集合内的内容会在导出分页时保持完整。</p></div>
+              <div class="single-region-control region-actions"><button class="ai-run-button split-region-button" id="splitRegionButton">✦ 分析并细分此块（保留原位）</button><button class="outline-button reanalyze-region-button" id="reanalyzeRegionButton">⟳ 原位重分析此块</button><p class="field-note split-region-note">重分析会独立检查当前语义块的原图与现有边界，可修正边缘或形状，不会拆分内容。</p></div>
+              <div class="property-block polygon-block single-region-control"><div class="label-with-value"><label>多边形边界顶点</label><button class="text-button" id="addPolygonVertex">＋ 添加顶点</button></div><span class="field-note">坐标为原图百分比；最少保留 3 个顶点。</span><div class="polygon-vertices" id="polygonVertices"></div></div>
+              <div class="property-block layer-controls single-region-control"><div class="label-with-value"><label>图层顺序</label><span class="field-note">覆盖关系</span></div><div class="layer-buttons"><button id="layerBottom">置底</button><button id="layerDown">下移</button><button id="layerUp">上移</button><button id="layerTop">置顶</button></div></div>
+              <div class="confidence-block single-region-control"><div class="confidence-heading"><span>AI 置信度</span><b id="confidenceValue">82%</b></div><div class="confidence-bar"><i id="confidenceBar"></i></div><span class="field-note" id="regionDescription">模型对该语义块的识别较为稳定</span></div>
               <button class="danger-outline" id="removeInspectorRegion">移除该内容块</button>
             </div>
-            <div class="divider-line"></div>
-            <section class="output-section"><div class="output-heading"><div><span class="eyebrow">OUTPUT</span><h3>终稿设置</h3></div><span class="ready-pill">READY</span></div><div class="output-row"><span>分页尺寸</span><select id="pageSize"><option value="a4">A4 · 竖版</option><option value="a3">A3 · 竖版</option><option value="letter">Letter · 竖版</option></select></div><div class="output-row"><span>集合不拆页</span><div class="toggle on" id="keepGroupsToggle"><i></i></div></div><div class="output-row"><span>页边距</span><span class="zero-margin">0 px（纯内容）</span></div><div class="page-flow"><span class="flow-node active">素材</span><i>→</i><span class="flow-node active">分区</span><i>→</i><span class="flow-node">分页</span><i>→</i><span class="flow-node">终稿</span></div><button class="full-export-button" id="inspectorExport"><span>✦</span>生成分页预览</button></section>
           </div>
+          <section class="output-section output-panel output-scroll"><div class="output-heading"><div><span class="eyebrow">OUTPUT</span><h3>终稿设置</h3></div><span class="ready-pill">READY</span></div><div class="output-row"><span>分页尺寸</span><select id="pageSize"><option value="a4">A4 · 竖版</option><option value="a3">A3 · 竖版</option><option value="letter">Letter · 竖版</option></select></div><div class="output-row"><span>集合不拆页</span><div class="toggle on" id="keepGroupsToggle"><i></i></div></div><div class="output-row"><label for="pageMargin">页边距（默认 0 px）</label><div class="page-margin-control"><input id="pageMargin" type="number" min="0" max="120" step="1" value="0"/><span>px</span></div></div><div class="page-flow"><span class="flow-node active">素材</span><i>→</i><span class="flow-node active">分区</span><i>→</i><span class="flow-node">分页</span><i>→</i><span class="flow-node">终稿</span></div><button class="full-export-button" id="inspectorExport"><span>✦</span>生成分页预览</button></section>
         </aside>
       </div>
     </div>

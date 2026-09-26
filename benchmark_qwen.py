@@ -19,14 +19,10 @@ import server
 
 MODELS = [
     # These are the model IDs exposed by the configured MaaS workspace.
-    "qwen3.6-plus",
+    "qwen3.8-flash",
+    "qwen3.7-plus",
     "qwen3.6-flash",
-    "qwen3-vl-plus",
-    "qwen3-vl-flash",
-    "qwen-vl-max",
-    "qwen-vl-plus",
-    "qwen2.5-vl-72b-instruct",
-    "qwen2.5-vl-32b-instruct",
+    "qwen3.6-plus",
 ]
 
 
@@ -70,8 +66,13 @@ def main() -> None:
             regions = parsed
         else:
             regions = []
-        complete = sum(all(key in item for key in ("x", "y", "w", "h")) for item in regions if isinstance(item, dict))
-        report.append({"model": model, "seconds": elapsed, "ok": not bool(error), "error": error, "regions": len(regions), "completeCoordinates": complete})
+        complete = sum(
+            isinstance(item, dict)
+            and isinstance(item.get("polygon"), list)
+            and len(item["polygon"]) >= 3
+            for item in regions
+        )
+        report.append({"model": model, "seconds": elapsed, "ok": not bool(error), "error": error, "regions": len(regions), "polygonRegions": complete})
         print(json.dumps(report[-1], ensure_ascii=False))
     print("\nSummary:")
     print(json.dumps(report, ensure_ascii=False, indent=2))

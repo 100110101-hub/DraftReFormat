@@ -19,15 +19,11 @@ def valid_supervisor_payload() -> dict:
                 "id": "r1",
                 "label": "Reaction Pathway A",
                 "kind": "chemical",
-                "x": 12.50,
-                "y": 8.20,
-                "w": 34.00,
-                "h": 21.50,
+                "polygon": [[12.50, 8.20], [46.50, 8.20], [42.00, 29.70], [15.00, 29.70]],
                 "confidence": 0.95,
                 "group": "Q1",
                 "description": "Complete reaction with catalyst labels",
                 "editAction": "keep",
-                "polygon": None,
                 "holes": None,
             }
         ],
@@ -35,6 +31,20 @@ def valid_supervisor_payload() -> dict:
 
 
 class StructuredOutputTests(unittest.TestCase):
+    def test_all_chemistry_agents_require_complete_edges_and_safety_clearance(self) -> None:
+        initial = server.segmentation_prompt()
+        revision = server.segmentation_revision_prompt([], ["Expand clipped atom label"], [])
+        supervisor = server.supervision_prompt([])
+
+        for prompt in (initial, revision, supervisor):
+            self.assertIn("1.5%", prompt)
+            self.assertIn("arrowhead", prompt.lower())
+            self.assertTrue("safety" in prompt.lower() or "clearance" in prompt.lower())
+
+        self.assertIn("stereochemical wedges/dashes", initial)
+        self.assertIn("mark revise and expand", supervisor)
+        self.assertIn("expand clipped/tight chemistry boundaries", revision.lower())
+
     def test_qwen_request_serializes_history_before_current_two_images(self) -> None:
         captured: dict = {}
 
@@ -77,18 +87,15 @@ class StructuredOutputTests(unittest.TestCase):
         source.save(encoded, format="PNG")
         image_data_url = "data:image/png;base64," + base64.b64encode(encoded.getvalue()).decode("ascii")
         regions = [
-            {"id": "rect", "label": "Text Block", "kind": "text", "x": 10, "y": 10, "w": 25, "h": 20, "group": "Q1"},
+            {"id": "rect", "label": "Text Block", "kind": "text", "x": 10, "y": 10, "w": 25, "h": 20, "polygon": [[10, 10], [35, 10], [33, 28], [12, 30]], "group": "Q1"},
             {
                 "id": "poly",
                 "label": "Triangle Diagram",
                 "kind": "diagram",
-                "x": 50,
-                "y": 20,
-                "w": 30,
-                "h": 40,
+                "x": 50, "y": 20, "w": 30, "h": 40,
                 "group": "Q2",
                 "polygon": [[50, 20], [80, 20], [65, 60]],
-                "holes": [{"x": 62, "y": 30, "w": 5, "h": 5}],
+                "holes": [{"polygon": [[62, 30], [67, 30], [65, 35]]}],
             },
         ]
         images = server.make_supervision_images(image_data_url, regions)
@@ -99,9 +106,16 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertGreater(rendered[1].height, rendered[0].height)
         self.assertNotEqual(rendered[0].getpixel((40, 30)), (255, 255, 255))
         self.assertNotEqual(rendered[0].getpixel((200, 60)), (255, 255, 255))
+        self.assertNotEqual(rendered[0].getpixel((252, 90)), (255, 255, 255))
+        self.assertEqual(rendered[0].getpixel((200, 180)), (255, 255, 255))
         prompt = server.supervision_prompt(regions)
         self.assertIn("exactly two aligned images", prompt)
         self.assertNotIn("three aligned images", prompt)
+        self.assertNotIn('"x":', prompt)
+        revision = server.segmentation_revision_prompt(regions, ["adjust edge"], regions)
+        self.assertNotIn('"x":', revision)
+        self.assertIn('"holes": [', revision)
+        self.assertIn('"polygon":', revision)
 
     def test_initial_output_omits_confidence_and_default_keep(self) -> None:
         regions = server.normalize_regions(
@@ -110,10 +124,7 @@ class StructuredOutputTests(unittest.TestCase):
                     "id": "r1",
                     "label": "Reaction Pathway A.",
                     "kind": "chemistry",
-                    "x": 12.54,
-                    "y": 8.24,
-                    "w": 34.06,
-                    "h": 21.55,
+                    "polygon": [[12.54, 8.24], [46.60, 8.24], [46.60, 29.79], [12.54, 29.79]],
                     "confidence": 0.91,
                     "group": "Q1",
                     "editAction": "keep",
@@ -136,6 +147,7 @@ class StructuredOutputTests(unittest.TestCase):
                     "w": 34.1,
                     "h": 21.6,
                     "group": "Q1",
+                    "polygon": [[12.5, 8.2], [46.6, 8.2], [46.6, 29.8], [12.5, 29.8]],
                 }
             ],
         )
@@ -147,6 +159,23 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertEqual(regions[0]["kind"], "chemical")
         self.assertEqual(regions[0]["editAction"], "keep")
         self.assertEqual(regions[0]["confidence"], 0.95)
+        self.assertEqual(regions[0]["polygon"], payload["regions"][0]["polygon"])
+
+    def test_supervisor_schema_rejects_rectangles_without_polygons(self) -> None:
+        payload = valid_supervisor_payload()
+        region = payload["regions"][0]
+        region.pop("polygon")
+        region.update({"x": 12.5, "y": 8.2, "w": 34.0, "h": 21.5})
+        violations = server.validate_supervision_response(payload)
+        self.assertTrue(any("extra fields" in item for item in violations))
+        self.assertTrue(any("polygon" in item for item in violations))
+
+    def test_supervisor_holes_accept_only_polygon_geometry(self) -> None:
+        payload = valid_supervisor_payload()
+        payload["regions"][0]["holes"] = [{"polygon": [[20, 15], [25, 14], [29, 18], [23, 21]]}]
+        self.assertEqual(server.validate_supervision_response(payload), [])
+        payload["regions"][0]["holes"] = [{"x": 20, "y": 15, "w": 8, "h": 6}]
+        self.assertTrue(any("holes" in item for item in server.validate_supervision_response(payload)))
 
     def test_invalid_pass_is_retried_before_acceptance(self) -> None:
         invalid = {"status": "pass", "issues": [], "regions": [{"id": "bad"}]}
@@ -155,11 +184,8 @@ class StructuredOutputTests(unittest.TestCase):
             {
                 "id": "r0",
                 "label": "Initial Block",
-                "kind": "chemistry",
-                "x": 1.0,
-                "y": 1.0,
-                "w": 10.0,
-                "h": 10.0,
+                    "kind": "chemistry",
+                    "polygon": [[1.0, 1.0], [11.0, 1.0], [11.0, 11.0], [1.0, 11.0]],
                 "group": "Q1",
             }
         ]
@@ -179,6 +205,54 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertEqual(regions[0]["kind"], "chemical")
         self.assertEqual(sent_images, [["overlay-1", "overlay-2"], ["overlay-1", "overlay-2"]])
 
+    def test_supervision_round_override_cannot_exceed_ten(self) -> None:
+        revise = valid_supervisor_payload()
+        revise["status"] = "revise"
+        revise["issues"] = ["Tighten polygon boundary"]
+        initial = [{
+            "id": "r0", "label": "Initial Block", "kind": "chemistry", "group": "Q1",
+            "polygon": [[1, 1], [11, 1], [11, 11], [1, 11]],
+        }]
+        with (
+            patch.dict(server.os.environ, {"QWEN_SUPERVISOR_ROUNDS": "99"}),
+            patch("server.make_supervision_images", return_value=["overlay-1", "overlay-2"]),
+            patch("server.qwen_request", return_value=(revise, None)),
+            patch("server.revise_regions", return_value=(initial, None)),
+        ):
+            _, audit, passed = server.supervise_regions("source-image", initial)
+        self.assertFalse(passed)
+        self.assertEqual(len(audit), 10)
+
+    def test_splitter_contract_requires_polygons_for_regions_and_holes(self) -> None:
+        valid = {
+            "regions": [{
+                "id": "r1", "label": "Text", "kind": "text", "group": "Q1",
+                "polygon": [[10, 10], [40, 12], [35, 30], [12, 28]],
+                "holes": [{"polygon": [[20, 15], [24, 16], [22, 20]]}],
+            }]
+        }
+        self.assertEqual(server.validate_segmentation_response(valid), [])
+        boxed = {"regions": [{**valid["regions"][0], "polygon": None, "x": 10, "y": 10, "w": 30, "h": 20, "holes": [{"x": 20, "y": 15, "w": 4, "h": 5}]}]}
+        violations = server.validate_segmentation_response(boxed)
+        self.assertTrue(any("forbidden or extra" in item for item in violations))
+        self.assertTrue(any("polygon" in item for item in violations))
+        self.assertTrue(any("holes" in item for item in violations))
+
+    def test_region_normalizer_does_not_reconstruct_model_rectangles(self) -> None:
+        boxed = [{"id": "r1", "label": "Text", "kind": "text", "x": 10, "y": 10, "w": 30, "h": 20, "group": "Q1"}]
+        self.assertEqual(server.normalize_regions(boxed), [])
+
+    def test_model_visible_region_payload_strips_editor_bounds_and_rectangular_holes(self) -> None:
+        internal = [{
+            "id": "r1", "label": "Text", "kind": "text", "x": 10, "y": 10, "w": 30, "h": 20,
+            "polygon": [[10, 10], [40, 12], [38, 30], [12, 28]], "group": "Q1",
+            "holes": [{"polygon": [[20, 15], [24, 16], [22, 20]]}],
+        }]
+        visible = server.model_visible_regions(internal)
+        self.assertEqual(set(visible[0]), {"id", "label", "kind", "polygon", "group", "holes"})
+        self.assertEqual(set(visible[0]["holes"][0]), {"polygon"})
+        self.assertNotIn('"x":', __import__("json").dumps(visible))
+
     def test_splitter_revision_uses_two_overlays_and_conversation_history(self) -> None:
         first_review = valid_supervisor_payload()
         first_review["status"] = "revise"
@@ -190,10 +264,7 @@ class StructuredOutputTests(unittest.TestCase):
                     "id": "r1",
                     "label": "Reaction Pathway A",
                     "kind": "chemistry",
-                    "x": 12.5,
-                    "y": 8.2,
-                    "w": 36.0,
-                    "h": 21.5,
+                    "polygon": [[12.5, 8.2], [48.5, 8.2], [48.5, 29.7], [12.5, 29.7]],
                     "group": "Q1",
                     "description": "Expanded complete reaction",
                 }
@@ -205,10 +276,7 @@ class StructuredOutputTests(unittest.TestCase):
                 "id": "r1",
                 "label": "Reaction Pathway A",
                 "kind": "chemistry",
-                "x": 12.5,
-                "y": 8.2,
-                "w": 34.0,
-                "h": 21.5,
+                "polygon": [[12.5, 8.2], [46.5, 8.2], [46.5, 29.7], [12.5, 29.7]],
                 "group": "Q1",
             }
         ]

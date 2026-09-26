@@ -59,7 +59,7 @@
           <section class="side-section ai-section">
               <div class="section-heading"><span>语义分区</span><span class="ai-chip">QWEN VISION</span></div>
               <div class="ai-card">
-                <div class="ai-card-top"><div class="qwen-orb">✦</div><div><strong>自动识别内容块</strong><span id="modelName">qwen-3.6-plus · 数值坐标辅助</span></div><div class="toggle on" id="autoSaveToggle"><i></i></div></div>
+                <div class="ai-card-top"><div class="qwen-orb">✦</div><div><strong>自动识别内容块</strong><span id="modelName">qwen3.8-flash · 多边形坐标辅助</span></div><div class="toggle on" id="autoSaveToggle"><i></i></div></div>
                 <p>理解题目、图表、化学结构式、生物图片与编号关系，生成可编辑的语义边界。</p>
                 <button class="ai-run-button" id="segmentButton"><span>✦</span>分析当前图片</button>
                 <button class="ai-batch-button" id="segmentAllButton">批量分析素材队列</button>
@@ -114,6 +114,7 @@
               <div class="property-block"><label>语义标签</label><input id="regionLabel" type="text" /><div class="suggestion-row"><button data-label="正文说明">正文说明</button><button data-label="图表 / 图片">图表 / 图片</button><button data-label="化学结构式">化学结构式</button></div></div>
               <div class="property-block"><label>内容类型</label><div class="select-like" id="kindSelect"><span id="regionKind">文字段落</span><span>⌄</span></div><div class="kind-menu" id="kindMenu"><button data-kind="text">文字段落</button><button data-kind="image">图片 / 插图</button><button data-kind="table">表格</button><button data-kind="chemistry">化学结构式</button><button data-kind="biology">生物图片</button><button data-kind="formula">数学公式</button></div></div>
               <div class="property-block"><div class="label-with-value"><label>编号集合</label><span class="group-badge" id="groupBadge">A</span></div><div class="group-input-row"><input id="regionGroup" type="text" /><button id="newGroupButton">新建</button></div><p class="field-note">同一集合内的内容会在导出分页时保持完整。</p></div>
+              <button class="ai-run-button split-region-button" id="splitRegionButton">✦ 分析并细分此块（保留原位）</button><p class="field-note split-region-note">细分后保留全部内容及块内相对位置；空白随块拆分自然收拢，不会删除内容。</p>
               <div class="property-block coordinates"><div class="label-with-value"><label>裁剪源位置</label><span class="field-note">原图百分比</span></div><div class="coord-grid"><label>X<input id="regionX" type="number" min="0" max="100" step="0.1" /></label><label>Y<input id="regionY" type="number" min="0" max="100" step="0.1" /></label><label>W<input id="regionW" type="number" min="1" max="100" step="0.1" /></label><label>H<input id="regionH" type="number" min="1" max="100" step="0.1" /></label></div></div>
               <div class="property-block layer-controls"><div class="label-with-value"><label>图层顺序</label><span class="field-note">覆盖关系</span></div><div class="layer-buttons"><button id="layerBottom">置底</button><button id="layerDown">下移</button><button id="layerUp">上移</button><button id="layerTop">置顶</button></div></div>
               <div class="confidence-block"><div class="confidence-heading"><span>AI 置信度</span><b id="confidenceValue">82%</b></div><div class="confidence-bar"><i id="confidenceBar"></i></div><span class="field-note" id="regionDescription">模型对该语义块的识别较为稳定</span></div>

@@ -17,6 +17,8 @@
 .long-canvas #paintLayer { z-index: 7; pointer-events: none; }
 .canvas-frame.painting #paintLayer { pointer-events: auto; cursor: crosshair; }
 .region-tile { position: absolute; overflow: hidden; border: 1px solid #d5dbe4; border-radius: 3px; background: #fff; box-shadow: 0 3px 11px rgba(45, 53, 67, .10); cursor: grab; transition: box-shadow .14s, border-color .14s; z-index: 2; }
+.region-tile.crop-preview-pending { display: grid; place-items: center; border-style: dashed; border-color: #c5cad4; box-shadow: none; }
+.region-tile.crop-preview-pending::after { content: "正在生成裁切预览"; color: #7e8795; background: rgba(255,255,255,.92); border-radius: 3px; padding: 4px 6px; font: 10px/1.2 sans-serif; }
 .region-tile:hover, .region-tile.selected { border-color: #8a75ea !important; box-shadow: 0 0 0 2px rgba(133, 117, 255, .18), 0 7px 19px rgba(45, 53, 67, .16); }
 .region-tile:active { cursor: grabbing; }
 .region-tile > img { display: block; width: 100%; height: 100%; object-fit: contain; object-position: left top; user-select: none; pointer-events: none; background: #fff; }

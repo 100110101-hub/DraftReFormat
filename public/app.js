@@ -106,14 +106,21 @@ function renderAssets() {
 function renderRegions() {
   const layer = $("#regionLayer");
   const items = visualRegions();
-  layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${items.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX || 28}px;top:${region.layoutY || 28}px;width:${region.layoutW || 1}px;height:${region.layoutH || 1}px;border-color:${kindColors[region.kind] || kindColors.other};z-index:${region.zIndex || 2}">
-    <img src="${region.cropSrc || image.src}" alt="${escapeHtml(region.label)}" draggable="false"/><div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span></div>`).join("")}`;
+  const positionedItems = items.filter(({ region }) => hasRegionLayout(region));
+  layer.innerHTML = `${state.layoutWhiteRects.map((rect) => `<div class="layout-whiteout" style="left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px"></div>`).join("")}${positionedItems.map(({ image, region }) => `<div class="region-tile ${region.id === state.selectedRegionId && image.id === state.currentId ? "selected" : ""} ${region.cropSrc ? "" : "crop-preview-pending"}" data-region-id="${region.id}" data-image-id="${image.id}" data-kind="${region.kind}" style="left:${region.layoutX}px;top:${region.layoutY}px;width:${region.layoutW}px;height:${region.layoutH}px;border-color:${kindColors[region.kind] || kindColors.other};z-index:${region.zIndex || 2}">
+    ${region.cropSrc ? `<img src="${region.cropSrc}" alt="${escapeHtml(region.label)}" draggable="false"/>` : ""}<div class="tile-label"><span>${escapeHtml(region.label)}</span><i>${escapeHtml(region.group || "—")}</i></div><span class="tile-kind">${kindShort[region.kind] || "BLOCK"}</span></div>`).join("")}`;
   $$(".region-tile").forEach((box) => {
     box.addEventListener("pointerdown", (event) => startRegionPointer(event, box));
     box.addEventListener("click", (event) => { event.stopPropagation(); state.currentId = box.dataset.imageId; state.selectedRegionId = box.dataset.regionId; renderRegions(); renderInspector(); });
   });
-  updateOutputCanvasSize(items);
+  updateOutputCanvasSize(positionedItems);
   if (!state.hydrating && items.some(({ region, image }) => !region.cropSrc && (!region.synthetic || !image.previewReady))) hydrateVisualRegions();
+}
+
+function hasRegionLayout(region) {
+  return Number.isFinite(region.layoutX) && Number.isFinite(region.layoutY)
+    && Number.isFinite(region.layoutW) && region.layoutW > 0
+    && Number.isFinite(region.layoutH) && region.layoutH > 0;
 }
 
 function visualRegions() {
@@ -128,26 +135,27 @@ function visualRegions() {
 
 function updateOutputCanvasSize(items) {
   const canvas = $("#outputCanvas"); if (!canvas) return;
-  const bottom = items.reduce((max, item) => Math.max(max, (item.region.layoutY || 28) + (item.region.layoutH || 1)), 0);
+  const bottom = items.reduce((max, item) => Math.max(max, item.region.layoutY + item.region.layoutH), 0);
   canvas.style.height = `${Math.max(1120, bottom + 44)}px`;
   canvas.style.minHeight = `${Math.max(1120, bottom + 44)}px`;
 }
 
 async function hydrateVisualRegions() {
+  if (state.hydrating) return;
   state.hydrating = true;
   try {
     const items = visualRegions();
+    const images = [...new Set(items.map(({ image }) => image))];
+    await Promise.all(images.map(ensureImageMetrics));
+
+    // Establish every block's real size and vertical position before any crop
+    // decoding starts. Otherwise newly analyzed blocks briefly render as 1px
+    // tiles at (28,28), which looks like the whole result collapsed to the corner.
+    normalizeLongLayout();
+    renderRegions();
+
     for (const { image, region } of items) {
-      if (!image.aspect || !image.sourceWidth) {
-        const size = await imageSize(image.src);
-        image.sourceWidth = size.width;
-        image.sourceHeight = size.height;
-        image.aspect = size.width && size.height ? size.width / size.height : .72;
-        // Fit large source images to the canvas, but never upscale a small one.
-        image.displayScale = Math.min(1, 760 / Math.max(1, image.sourceWidth));
-      }
       if (region.synthetic) { region.layoutW = 740; region.layoutH = Math.round(740 / (image.aspect || .72)); }
-      else if (!region.layoutW || !region.layoutH) initializeRegionLayout(region, image);
       if (!region.cropSrc && !region.synthetic) region.cropSrc = await cropRegion(image, region);
       if (region.synthetic && !region.cropSrc) { region.cropSrc = image.src; image.previewReady = true; }
     }
@@ -159,14 +167,26 @@ async function hydrateVisualRegions() {
   }
 }
 
+async function ensureImageMetrics(image) {
+  if (image.sourceWidth && image.sourceHeight && image.aspect) return;
+  const size = await imageSize(image.src);
+  image.sourceWidth = size.width;
+  image.sourceHeight = size.height;
+  image.aspect = size.width && size.height ? size.width / size.height : .72;
+  // Fit large source images to the canvas, but never upscale a small one.
+  image.displayScale = Math.min(1, 760 / Math.max(1, image.sourceWidth));
+}
+
 function imageSize(src) { return new Promise((resolve) => { const img = new Image(); img.onload = () => resolve({ width: img.naturalWidth || 760, height: img.naturalHeight || Math.round(760 / .72) }); img.onerror = () => resolve({ width: 760, height: Math.round(760 / .72) }); img.src = src; }); }
 
 function initializeRegionLayout(region, image) {
   const baseWidth = Math.min(760, image.sourceWidth || 760);
   const scale = image.displayScale || (baseWidth / Math.max(1, image.sourceWidth || baseWidth));
   // Keep the crop's native proportions and never enlarge a source image.
-  region.layoutW = Math.max(1, Math.round((image.sourceWidth || baseWidth) * region.w / 100 * scale));
-  region.layoutH = Math.max(1, Math.round((image.sourceHeight || baseWidth / (image.aspect || .72)) * region.h / 100 * scale));
+  const sourceW = Math.max(0.1, Number(region.w) || 100);
+  const sourceH = Math.max(0.1, Number(region.h) || 100);
+  region.layoutW = Math.max(1, Math.round((image.sourceWidth || baseWidth) * sourceW / 100 * scale));
+  region.layoutH = Math.max(1, Math.round((image.sourceHeight || baseWidth / (image.aspect || .72)) * sourceH / 100 * scale));
   region.layoutX = 28;
   const all = visualRegions().filter(({ region: item }) => item !== region && item.layoutY != null);
   const last = all.reduce((max, item) => Math.max(max, item.region.layoutY + item.region.layoutH), 30);
@@ -176,10 +196,12 @@ function initializeRegionLayout(region, image) {
 function normalizeLongLayout() {
   let y = 28;
   state.images.forEach((image) => {
-    const regions = image.regions.length ? image.regions : [image.syntheticRegion];
+    const regions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
     regions.forEach((region) => {
-      if (!region.layoutW || !region.layoutH) initializeRegionLayout(region, image);
+      if (!hasRegionLayout(region)) initializeRegionLayout(region, image);
       if (!region.userMoved) { region.layoutX = 28; region.layoutY = y; }
+      if (!Number.isFinite(region.layoutX)) region.layoutX = 28;
+      if (!Number.isFinite(region.layoutY)) region.layoutY = y;
       y = Math.max(y, region.layoutY + region.layoutH + 24);
     });
     y += 20;
@@ -224,6 +246,7 @@ function bindEvents() {
   $("#saveProjectButton").addEventListener("click", saveProject);
   $("#exportButton").addEventListener("click", exportFinal); $("#inspectorExport").addEventListener("click", exportFinal);
   $("#deleteRegion").addEventListener("click", deleteSelected); $("#removeInspectorRegion").addEventListener("click", deleteSelected);
+  $("#splitRegionButton").addEventListener("click", segmentSelectedRegion);
   $("#clearWhiteouts").addEventListener("click", clearWhiteouts);
   $("#renameProject").addEventListener("click", () => { const name = prompt("项目名称", state.projectName); if (name?.trim()) { state.projectName = name.trim(); render(); } });
   $("#sortImages").addEventListener("click", () => { pushHistory(); state.images.sort((a, b) => a.name.localeCompare(b.name, "zh")); render(); showToast("已按文件名排序", "success"); });
@@ -357,6 +380,104 @@ async function segmentCurrent() {
     showToast(result.source === "qwen-supervised" ? `Qwen 分割 + 监督审校完成（${result.supervision?.rounds || 1} 轮）` : "已使用离线演示分区（可继续手动调整）", result.source === "qwen-supervised" ? "success" : "warn");
   } catch (error) { showToast(error.message || "分析失败，请稍后重试", "error"); }
   finally { button.disabled = false; button.innerHTML = "<span>✦</span>分析当前图片"; }
+}
+
+async function segmentSelectedRegion() {
+  const image = currentImage();
+  const parent = selectedRegion();
+  if (!image || !parent || parent.synthetic) return showToast("请先选择一个可细分的内容块", "warn");
+  if (parent.editAction === "delete") return showToast("删除标记的内容块不能细分；请先恢复为保留内容", "warn");
+  const button = $("#splitRegionButton");
+  const originalLabel = button.textContent;
+  const geometryKey = JSON.stringify({ x: parent.x, y: parent.y, w: parent.w, h: parent.h, polygon: parent.polygon, holes: parent.holes });
+  button.disabled = true;
+  button.textContent = "正在分析此块…";
+  setProcessingStatus("正在裁出选中块并进行局部分割…");
+  try {
+    const crop = parent.cropSrc || await cropRegion(image, parent);
+    if (!crop.startsWith("data:image/")) throw new Error("该网页图片无法本地裁剪；请先重新导入图片");
+    const response = await fetch("/api/segment", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image: crop,
+        hint: "LOCAL REGION REFINEMENT: Split only the supplied crop into smaller independently editable semantic polygons. Return every visible mark and all content; do not delete, omit, or mark any child as delete. Preserve every word, stroke, symbol, and semantic unit. Give each child its true coordinates within this crop. The editor will map those coordinates back to the parent block and preserve their relative positions, so whitespace can collapse when the parent is replaced without deleting any content. Do not include crop boundaries or blank padding as regions.",
+      }),
+    });
+    let result = await response.json();
+    if (!response.ok) throw new Error(result.error || "局部分割失败");
+    if (result.jobId) {
+      button.textContent = "监督审校中…";
+      setProcessingStatus("选中块初分完成，监督 agent 正在复核多边形与挖空…");
+      result = await waitForSupervision(result.jobId, result);
+    }
+    if (result.source !== "qwen-supervised") {
+      throw new Error(result.supervision?.issues?.[0] || "局部分割未通过多边形审校；原块保持不变");
+    }
+    if (!Array.isArray(result.regions) || result.regions.length < 2) {
+      throw new Error("模型没有找到两个或更多子区域；原块保持不变");
+    }
+    const liveParent = image.regions.find((region) => region.id === parent.id);
+    const liveGeometryKey = liveParent && JSON.stringify({ x: liveParent.x, y: liveParent.y, w: liveParent.w, h: liveParent.h, polygon: liveParent.polygon, holes: liveParent.holes });
+    if (!liveParent || liveGeometryKey !== geometryKey) throw new Error("分析期间原块的裁剪范围已改变；请重新选择并分析");
+    if (!image.sourceWidth || !image.sourceHeight) {
+      const size = await imageSize(image.src);
+      image.sourceWidth = size.width;
+      image.sourceHeight = size.height;
+      image.aspect = size.width / Math.max(1, size.height);
+      image.displayScale = Math.min(1, 760 / Math.max(1, size.width));
+    }
+    if (!Number.isFinite(liveParent.layoutW) || !Number.isFinite(liveParent.layoutH)) initializeRegionLayout(liveParent, image);
+
+    const children = result.regions.map((child, index) => {
+      const polygon = child.polygon.map(([x, y]) => [
+        +(liveParent.x + Number(x) * liveParent.w / 100).toFixed(3),
+        +(liveParent.y + Number(y) * liveParent.h / 100).toFixed(3),
+      ]);
+      const xs = polygon.map(([x]) => x), ys = polygon.map(([, y]) => y);
+      const x = Math.min(...xs), y = Math.min(...ys);
+      const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+      const holes = (child.holes || []).map((hole) => ({
+        polygon: hole.polygon.map(([hx, hy]) => [
+          +(liveParent.x + Number(hx) * liveParent.w / 100).toFixed(3),
+          +(liveParent.y + Number(hy) * liveParent.h / 100).toFixed(3),
+        ]),
+      }));
+      return {
+        ...child,
+        id: `${liveParent.id}.${child.id || `part-${index + 1}`}`,
+        parentRegionId: liveParent.id,
+        group: liveParent.group,
+        x, y, w, h, polygon, holes,
+        editAction: "keep",
+        cropSrc: null,
+        layoutX: liveParent.layoutX + Number(child.x) * liveParent.layoutW / 100,
+        layoutY: liveParent.layoutY + Number(child.y) * liveParent.layoutH / 100,
+        layoutW: Math.max(1, liveParent.layoutW * Number(child.w) / 100),
+        layoutH: Math.max(1, liveParent.layoutH * Number(child.h) / 100),
+        userMoved: true,
+      };
+    }).filter((child) => child.polygon.length >= 3 && child.w > 0 && child.h > 0);
+    if (children.length < 2) throw new Error("审校结果不足两个有效子多边形；原块保持不变");
+
+    pushHistory();
+    const parentIndex = image.regions.findIndex((region) => region.id === liveParent.id);
+    image.regions.splice(parentIndex, 1, ...children);
+    image.previewReady = false;
+    image.analyzed = true;
+    if (state.currentId === image.id) state.selectedRegionId = children[0].id;
+    state.lastAnalyzed = "刚刚";
+    state.lastSupervision = result.supervision || null;
+    render();
+    setProcessingStatus(`已细分为 ${children.length} 个多边形块，并保留块内相对位置`);
+    showToast(`内容块已细分为 ${children.length} 块；内容未删除，块内位置已保留`, "success");
+  } catch (error) {
+    setProcessingStatus("选中块细分未更改原分区");
+    showToast(error.message || "局部分割失败", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
 }
 
 async function segmentAll() {
@@ -555,22 +676,15 @@ function cropRegion(image, region) {
 function drawCropHole(ctx, hole, region, width, height) {
   ctx.save();
   ctx.fillStyle = "#fff";
-  if (Array.isArray(hole?.polygon) && hole.polygon.length >= 3) {
-    ctx.beginPath();
-    hole.polygon.forEach((point, index) => {
-      const px = ((Number(point[0]) - region.x) / region.w) * width;
-      const py = ((Number(point[1]) - region.y) / region.h) * height;
-      index ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
-    });
-    ctx.closePath();
-    ctx.fill();
-  } else {
-    const x = ((Number(hole?.x) || 0) - region.x) / region.w * width;
-    const y = ((Number(hole?.y) || 0) - region.y) / region.h * height;
-    const w = (Number(hole?.w) || 0) / region.w * width;
-    const h = (Number(hole?.h) || 0) / region.h * height;
-    ctx.fillRect(x, y, w, h);
-  }
+  if (!Array.isArray(hole?.polygon) || hole.polygon.length < 3) { ctx.restore(); return; }
+  ctx.beginPath();
+  hole.polygon.forEach((point, index) => {
+    const px = ((Number(point[0]) - region.x) / region.w) * width;
+    const py = ((Number(point[1]) - region.y) / region.h) * height;
+    index ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  });
+  ctx.closePath();
+  ctx.fill();
   ctx.restore();
 }
 

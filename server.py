@@ -55,9 +55,10 @@ load_dotenv()
 # Read Qwen settings after loading the local .env file.  This keeps explicit
 # process environment variables authoritative while allowing the normal local
 # setup (copying .env.example to .env) to configure the MaaS endpoint.
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.6-plus")
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.8-flash")
 QWEN_ENDPOINT = os.environ.get(
-    "QWEN_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    "QWEN_ENDPOINT",
+    "https://ws-yqr3lqq5xyjbxf30.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
 )
 QWEN_REQUEST_TIMEOUT = float(os.environ.get("QWEN_REQUEST_TIMEOUT", "180"))
 QWEN_LAST_ERROR = ""
@@ -99,10 +100,7 @@ def heuristic_regions() -> list[dict[str, Any]]:
             "id": "region-1",
             "label": "标题 / 题干",
             "kind": "text",
-            "x": 7,
-            "y": 6,
-            "w": 86,
-            "h": 14,
+            "polygon": [[7, 6], [93, 6], [93, 20], [7, 20]],
             "confidence": 0.82,
             "group": "A",
             "description": "检测到的主标题或题干区域",
@@ -111,10 +109,7 @@ def heuristic_regions() -> list[dict[str, Any]]:
             "id": "region-2",
             "label": "正文说明",
             "kind": "text",
-            "x": 8,
-            "y": 23,
-            "w": 84,
-            "h": 25,
+            "polygon": [[8, 23], [92, 23], [92, 48], [8, 48]],
             "confidence": 0.76,
             "group": "A",
             "description": "连贯文字段落，建议作为一个语义块",
@@ -123,10 +118,7 @@ def heuristic_regions() -> list[dict[str, Any]]:
             "id": "region-3",
             "label": "图表 / 图片",
             "kind": "image",
-            "x": 10,
-            "y": 53,
-            "w": 38,
-            "h": 30,
+            "polygon": [[10, 53], [48, 53], [48, 83], [10, 83]],
             "confidence": 0.71,
             "group": "B",
             "description": "图像、插图或数据图表",
@@ -135,10 +127,7 @@ def heuristic_regions() -> list[dict[str, Any]]:
             "id": "region-4",
             "label": "公式 / 结构式",
             "kind": "chemistry",
-            "x": 53,
-            "y": 55,
-            "w": 37,
-            "h": 24,
+            "polygon": [[53, 55], [90, 55], [90, 79], [53, 79]],
             "confidence": 0.68,
             "group": "B",
             "description": "化学结构式、数学公式或生物标注图",
@@ -213,13 +202,17 @@ def _draw_candidate_boundaries(
     proposal: list[dict[str, Any]],
     content_box: tuple[int, int, int, int],
 ) -> None:
-    """Draw bboxes, exact polygons, holes, and IDs over one source image."""
+    """Draw polygon boundaries, holes, and IDs over one source image.
+
+    Rectangles are deliberately never painted here. They are only derived
+    internally for cropping and layout compatibility; the model sees the
+    actual polygon boundary as the sole region outline.
+    """
 
     draw = ImageDraw.Draw(canvas)
     left, top, right, bottom = content_box
     width, height = max(1, right - left), max(1, bottom - top)
     line_width = max(3, round(max(width, height) / 600))
-    thin_width = max(2, line_width // 2)
     font = _overlay_font(max(13, line_width * 4))
 
     def point(px: Any, py: Any) -> tuple[int, int]:
@@ -230,50 +223,34 @@ def _draw_candidate_boundaries(
 
     for index, region in enumerate(proposal[:80]):
         try:
-            x = max(0, min(100, float(region.get("x", 0))))
-            y = max(0, min(100, float(region.get("y", 0))))
-            w = max(0, min(100 - x, float(region.get("w", 0))))
-            h = max(0, min(100 - y, float(region.get("h", 0))))
-            if not w or not h:
-                continue
-            x0, y0 = point(x, y)
-            x1, y1 = point(x + w, y + h)
             deleting = str(region.get("editAction") or "").lower() == "delete"
-            bbox_color = (224, 45, 55) if deleting else (20, 105, 235)
             polygon_color = (224, 45, 55) if deleting else (155, 45, 220)
             raw_polygon = region.get("polygon")
-            polygon: list[tuple[int, int]] = []
-            if isinstance(raw_polygon, list):
-                for raw_point in raw_polygon:
-                    if isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2:
-                        polygon.append(point(raw_point[0], raw_point[1]))
-            if len(polygon) >= 3:
-                # Show the numeric bbox as a thin reference, then emphasize the
-                # true non-rectangular cutting boundary.
-                draw.rectangle((x0, y0, x1, y1), outline=bbox_color, width=thin_width)
-                draw.line(polygon + [polygon[0]], fill=polygon_color, width=line_width, joint="curve")
-            else:
-                polygon = []
-                draw.rectangle((x0, y0, x1, y1), outline=bbox_color, width=line_width)
+            if not isinstance(raw_polygon, list) or len(raw_polygon) < 3:
+                continue
+            polygon = [point(raw_point[0], raw_point[1]) for raw_point in raw_polygon if isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2]
+            if len(polygon) < 3:
+                continue
+            draw.line(polygon + [polygon[0]], fill=polygon_color, width=line_width, joint="curve")
+            x0, y0 = polygon[0]
 
             for hole in region.get("holes") or []:
-                if not isinstance(hole, dict) or not all(key in hole for key in ("x", "y", "w", "h")):
+                if not isinstance(hole, dict) or not isinstance(hole.get("polygon"), list) or len(hole["polygon"]) < 3:
                     continue
-                hx0, hy0 = point(hole["x"], hole["y"])
-                hx1, hy1 = point(float(hole["x"]) + float(hole["w"]), float(hole["y"]) + float(hole["h"]))
-                draw.rectangle((hx0, hy0, hx1, hy1), outline=(245, 126, 24), width=line_width)
+                hole_polygon = [point(raw_point[0], raw_point[1]) for raw_point in hole["polygon"] if isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2]
+                if len(hole_polygon) >= 3:
+                    draw.line(hole_polygon + [hole_polygon[0]], fill=(245, 126, 24), width=line_width, joint="curve")
 
             label = str(region.get("id") or f"r{index + 1}")
             group = str(region.get("group") or "")
-            suffix = " DELETE" if deleting else " POLY" if polygon else ""
+            suffix = " DELETE" if deleting else " POLY"
             tag = f"{label}{' / ' + group if group else ''}{suffix}"
             text_box = draw.textbbox((0, 0), tag, font=font, stroke_width=1)
             tag_width = text_box[2] - text_box[0] + 10
             tag_height = text_box[3] - text_box[1] + 8
             tag_x = max(left, min(right - tag_width, x0))
             tag_y = y0 - tag_height if y0 - tag_height >= top else min(bottom - tag_height, y0 + line_width)
-            draw.rectangle((tag_x, tag_y, tag_x + tag_width, tag_y + tag_height), fill=polygon_color if polygon else bbox_color)
-            draw.text((tag_x + 5, tag_y + 3), tag, font=font, fill="white", stroke_width=1, stroke_fill=(30, 30, 30))
+            draw.text((tag_x + 2, tag_y + 2), tag, font=font, fill="white", stroke_width=2, stroke_fill=polygon_color)
         except (TypeError, ValueError):
             continue
 
@@ -322,9 +299,9 @@ def _encode_review_image(image: Any) -> str:
 def make_supervision_images(image_data_url: str, proposal: list[dict[str, Any]]) -> list[str]:
     """Create exactly two framed candidate views for the supervisor.
 
-    Image 1 retains a compact source view with all candidate boundaries.
+    Image 1 retains a compact source view with all candidate polygon boundaries.
     Image 2 enlarges the source and adds external numeric coordinates while
-    repeating the same rectangle/polygon/hole overlays.
+    repeating the same polygon/hole overlays.
     """
 
     if Image is None:
@@ -416,19 +393,20 @@ def qwen_request(
 
 
 def segmentation_prompt(hint: str = "") -> str:
-    return """You are a document-layout and semantic-cropping agent. Analyze the supplied draft image and return every independently editable semantic region for downstream cropping and pagination.
+    return """You are a document-layout and semantic-cropping agent. Analyze the supplied draft image and return every independently editable semantic region for downstream cropping and pagination. The geometry contract is polygons only. Trace the actual content silhouette; do not substitute loose bounding rectangles or axis-aligned boxes.
 
 SEGMENTATION RULES
-1. Use tight, content-specific regions. Include all visible strokes, punctuation, subscripts/superscripts, captions, borders, arrows, chemical bonds, and image edges. Do not clip content and do not add large blank margins.
-2. Keep a complete chemical reaction, mechanism, arrow sequence, reactants, intermediates, products, conditions, catalysts, and connected annotations together. Never split a chemically or semantically indivisible unit.
-3. Detect text, figures, tables, chemistry, biology, formulas, question parts, and small but meaningful fragments. Do not discard content to reduce region count.
-4. A boxed, circled, crossed-out, or struck-through item is its own deletion region with editAction="delete". A nearby correction or replacement is a separate region. If a large outer region contains an internal deletion box, keep the outer region and represent the deleted area in holes.
-5. Use polygon for triangular, wedge-shaped, or otherwise irregular content when a rectangle would include unrelated material. Always include the enclosing x/y/w/h.
-6. Regions belonging to one logical question or image-number collection share one group. Deletion and correction regions remain traceable through their group.
-7. Ignore coordinate axes, tick marks, numeric labels, decorative lines, headers, footers, page numbers, and blank padding added around the source image.
+1. Use content-specific polygon regions that fully enclose the content. Include all visible strokes, punctuation, subscripts/superscripts, captions, borders, arrows, chemical bonds, and image edges. Never let a polygon edge touch or cross printed ink. A modest white safety margin is required; avoiding clipped content has priority over tight crops.
+2. CHEMICAL EDGE-SAFETY RULE: for every molecule, structural formula, reaction equation, or mechanism, draw the polygon around the complete ink envelope with visible white clearance outside the outermost mark. Aim for at least 1.5% of the original image width on the left/right and 1.5% of its height above/below whenever that whitespace exists; use more clearance for tiny terminal labels. Do not trace tightly around atom labels or bond lines, and do not put vertices on bond endpoints.
+3. Preserve every part of chemistry: all atoms and element symbols, implicit/explicit bond ends, charge marks, isotope numbers, stereochemical wedges/dashes, lone-pair dots, ring bonds, curved electron-pushing arrows and arrowheads, reaction arrows and arrowheads, plus/minus signs, reagents, solvent/temperature/pressure/catalyst labels, yield, and detached conditions above or below arrows. Keep the complete reaction sequence/mechanism together as one semantic region; never split at a reaction arrow, intermediate, or step label.
+4. Detect text, figures, tables, chemistry, biology, formulas, question parts, and small but meaningful fragments. Do not discard content to reduce region count. Include nearby caption/annotation when it is necessary to interpret the chemical or scientific figure.
+5. A circled, crossed-out, or struck-through item is its own deletion region with editAction="delete". A nearby correction or replacement is a separate region. If a large outer region contains an internal deletion area, keep the outer region and represent the excluded area as a polygon in holes. A hole must also leave safety clearance around the ink being removed and must not erase neighboring reaction marks.
+6. Every region MUST have a polygon with at least three points. Trace angled, notched, triangular, curved, and irregular outer boundaries with enough vertices to follow their shape, while keeping the safety margin outside all ink; do not default to four-corner boxes. The polygon itself is the complete cutting boundary; do not output any separate rectangular boundary.
+7. Regions belonging to one logical question or image-number collection share one group. Deletion and correction regions remain traceable through their group.
+8. Ignore coordinate axes, tick marks, numeric labels, decorative lines, headers, footers, page numbers, and blank padding added around the source image.
 
 COORDINATES
-The analysis image has an outer blue 0–100 coordinate frame and no interior grid. Treat that frame as an overlay only. Return x, y, w, h and polygon points as percentages of the original inner image: top-left is (0,0), bottom-right is (100,100), and x+w/y+h must not exceed 100. Round x/y/w/h and polygon points to one decimal place.
+The analysis image has an outer blue 0–100 coordinate frame and no interior grid. Treat that frame as an overlay only. Return polygon points as percentages of the original inner image: top-left is (0,0), bottom-right is (100,100), and every point must be in [0,100]. Round polygon points to one decimal place.
 
 USER NOTE
 """ + (hint or "None") + """
@@ -442,15 +420,11 @@ Return strict, valid JSON only. Do not use markdown code blocks, comments, or ex
       "id": "r1",
       "label": "Reaction Pathway A",
       "kind": "chemistry",
-      "x": 12.5,
-      "y": 8.2,
-      "w": 34.0,
-      "h": 21.5,
+      "polygon": [[12.5,8.2],[28.0,6.8],[46.5,8.2],[42.0,21.0],[39.0,29.7],[15.0,29.7]],
       "group": "Q1",
       "description": "Multi-step synthesis with catalyst labels",
       "editAction": "delete",
-      "polygon": [[12.5,8.2],[46.5,8.2],[42.0,29.7],[15.0,29.7]],
-      "holes": [{"x": 20.0, "y": 15.0, "w": 10.0, "h": 5.0}]
+      "holes": [{"polygon": [[20.0,15.0],[26.0,14.0],[30.0,16.0],[28.0,20.0],[22.0,21.0]]}]
     }
   ]
 }
@@ -458,13 +432,37 @@ Return strict, valid JSON only. Do not use markdown code blocks, comments, or ex
 FIELD CONSTRAINTS
 - id is a unique string. label is concise English, at most five words, with no trailing punctuation.
 - kind is exactly one of: ["text", "image", "table", "chemistry", "biology", "formula", "other"].
-- x, y, w, h are numbers in [0,100], with x+w<=100 and y+h<=100.
+- polygon is required, contains at least three [x,y] pairs, and is the only region boundary. Trace the actual content silhouette rather than defaulting to four-corner boxes. All points are numbers in [0,100].
 - group is a logical grouping string. description is optional.
 - editAction is optional and, when present, is exactly "keep" or "delete". Omit it unless deletion/correction rules explicitly require it; the default is "keep".
-- polygon is optional, contains at least three [x,y] percentage pairs, and should be omitted for a sufficiently rectangular region.
-- holes is optional; each hole is an object with absolute original-image x/y/w/h percentages and should be omitted when there is no internal exclusion.
+- Do not output x, y, w, h, bbox, or any other boundary fields besides polygon.
+- holes is optional; each hole is an object containing a required polygon of at least three absolute original-image [x,y] percentage points. Never use rectangular coordinates for a hole.
 - If a field is not applicable, omit it entirely. Never emit null, empty strings, empty arrays, confidence, color, rotation, or any other extra field.
 - The response must start with { and end with }, with zero whitespace outside the JSON. Use double quotes, valid UTF-8, and no trailing commas."""
+
+
+def model_visible_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip editor-only bounds before candidate data is shown to any agent."""
+
+    visible: list[dict[str, Any]] = []
+    for region in regions[:80]:
+        if not isinstance(region, dict) or not isinstance(region.get("polygon"), list):
+            continue
+        item: dict[str, Any] = {}
+        for key in ("id", "label", "kind", "polygon", "group", "description", "editAction", "confidence"):
+            if key in region:
+                item[key] = region[key]
+        holes = region.get("holes")
+        if isinstance(holes, list):
+            visible_holes = [
+                {"polygon": hole["polygon"]}
+                for hole in holes
+                if isinstance(hole, dict) and isinstance(hole.get("polygon"), list)
+            ]
+            if visible_holes:
+                item["holes"] = visible_holes
+        visible.append(item)
+    return visible
 
 
 def segmentation_revision_prompt(
@@ -477,21 +475,21 @@ def segmentation_revision_prompt(
     return """Continue your role as the document-layout and semantic-cropping agent from the conversation history.
 
 You receive exactly two aligned images containing the same current candidate regions:
-1. Candidate Boundary Overlay: the original image at a compact scale with every current rectangle or exact polygon drawn over the source content.
-2. Enlarged Coordinate Boundary Overlay: an enlarged view with the same boundaries plus external numeric 0–100 X/Y axes. There are no interior grid lines.
+1. Candidate Boundary Overlay: the original image at a compact scale with every current polygon boundary drawn over the source content.
+2. Enlarged Coordinate Boundary Overlay: an enlarged view with the same polygon boundaries plus external numeric 0–100 X/Y axes. There are no interior grid lines.
 
-Each boundary is labeled with its region ID and group. Blue is a rectangular keep candidate. Purple is an exact polygon candidate; its thin blue rectangle is only its bounding box. Red is a deletion candidate. Orange rectangles are holes/cutouts. All colored lines, labels, axes, and outer padding are review overlays, not source content. No separate clean original image is supplied in this revision turn.
+Every candidate is outlined by one colored polygon and labeled with its region ID and group. Purple polygons are keep candidates; red polygons are deletion candidates; orange polygons are internal holes/cutouts. There are no candidate rectangles or bbox outlines in either image. All colored lines, labels, axes, and outer padding are review overlays, not source content. No separate clean original image is supplied in this revision turn.
 
-Revise the complete region list using the supervisor feedback below. Return every valid region, including unchanged regions; never return a partial diff. Read precise coordinate values from the enlarged coordinate overlay, but measure all percentages against the original inner image, not the enlarged canvas or outer axes. Preserve every content edge and each complete semantic unit. Keep complete chemical equations, reaction pathways, mechanisms, arrows, conditions, catalysts, and connected annotations together. Keep boxed/crossed-out content as a separate delete region, keep nearby corrections separate, and preserve internal deletions as absolute-coordinate holes. Use polygons for triangular or irregular boundaries when needed.
+Revise the complete region list using the supervisor feedback below. Return every valid region, including unchanged regions; never return a partial diff. Read precise coordinate values from the enlarged coordinate overlay, but measure all percentages against the original inner image, not the enlarged canvas or outer axes. Preserve every content edge and each complete semantic unit. For every chemical structure/equation/mechanism, place the polygon outside the outermost ink with a visible white safety buffer (aim for at least 1.5% of original-image width and height where available); never let a vertex touch a bond, atom label, arrowhead, charge, isotope, stereomark, or condition. Expand clipped/tight chemistry boundaries even if this introduces a small amount of white space. Include every reactant, intermediate, product, bond endpoint, curved/reaction arrowhead, catalyst/reagent/solvent/temperature label, yield, and connected annotation in one complete semantic unit. Keep crossed-out content as a separate delete region, keep nearby corrections separate, and preserve internal deletions as absolute-coordinate polygon holes. Holes around chemical ink also need a white safety buffer and must not remove adjacent content. Use polygons for every region and every hole; never output rectangle fields for regions or holes.
 
 SUPERVISOR ISSUES
 """ + json.dumps(issues, ensure_ascii=False) + """
 
 CURRENT SEGMENTATION
-""" + json.dumps(current, ensure_ascii=False) + """
+""" + json.dumps(model_visible_regions(current), ensure_ascii=False) + """
 
 SUPERVISOR'S CORRECTED REFERENCE
-""" + json.dumps(supervisor_regions, ensure_ascii=False) + """
+""" + json.dumps(model_visible_regions(supervisor_regions), ensure_ascii=False) + """
 
 OUTPUT SPECIFICATION & SCHEMA
 Return strict, valid JSON only. Do not use markdown code blocks, comments, or explanatory text. The output must be directly parseable by a standard JSON parser.
@@ -502,15 +500,11 @@ Return strict, valid JSON only. Do not use markdown code blocks, comments, or ex
       "id": "r1",
       "label": "Reaction Pathway A",
       "kind": "chemistry",
-      "x": 12.5,
-      "y": 8.2,
-      "w": 34.0,
-      "h": 21.5,
+      "polygon": [[12.5,8.2],[28.0,6.8],[46.5,8.2],[42.0,21.0],[39.0,29.7],[15.0,29.7]],
       "group": "Q1",
       "description": "Multi-step synthesis with catalyst labels",
       "editAction": "delete",
-      "polygon": [[12.5,8.2],[46.5,8.2],[42.0,29.7],[15.0,29.7]],
-      "holes": [{"x": 20.0, "y": 15.0, "w": 10.0, "h": 5.0}]
+      "holes": [{"polygon": [[20.0,15.0],[26.0,14.0],[30.0,16.0],[28.0,20.0],[22.0,21.0]]}]
     }
   ]
 }
@@ -518,11 +512,11 @@ Return strict, valid JSON only. Do not use markdown code blocks, comments, or ex
 FIELD CONSTRAINTS
 - id is unique. label is concise English with at most five words and no trailing punctuation.
 - kind is exactly one of ["text", "image", "table", "chemistry", "biology", "formula", "other"]. Convert supervisor kinds such as chemical/diagram/annotation to the closest value in this enum.
-- x, y, w, h and polygon points are percentages in [0,100] relative to the original inner image; x+w<=100 and y+h<=100. Round them to one decimal place.
+- polygon is required, contains at least three [x,y] pairs, and is the only region boundary. Trace the actual content silhouette rather than defaulting to four-corner boxes. Every point is a percentage in [0,100] relative to the original inner image. Round points to one decimal place.
 - group is a logical grouping string. description is optional.
 - editAction is optional and exactly "keep" or "delete" when present. Omit ordinary "keep" values; default is "keep".
-- polygon is optional, contains at least three [x,y] pairs, and is omitted for sufficiently rectangular content.
-- holes is optional; each hole contains absolute original-image x/y/w/h percentages. Omit holes when none exist.
+- Do not output x, y, w, h, bbox, or any other boundary fields besides polygon.
+- holes is optional; each hole contains a polygon with absolute original-image [x,y] percentages. Omit holes when none exist. Never use rectangular coordinates for a hole.
 - Omit every inapplicable field. Never emit null, empty strings, empty arrays, confidence, color, rotation, or extra fields.
 - The response must start with { and end with }, with zero whitespace outside the JSON. Use double quotes and no trailing commas."""
 
@@ -533,23 +527,23 @@ def supervision_prompt(current: list[dict[str, Any]]) -> str:
     return """You are a production Layout Segmentation QA and Supervisor Agent.
 
 You receive exactly two aligned images containing the same candidate regions:
-1. Candidate Boundary Overlay: a compact view of the original image with every candidate rectangle or exact polygon drawn over its source content.
-2. Enlarged Coordinate Boundary Overlay: a higher-resolution enlarged view with the same candidate boundaries plus external numeric 0–100 X/Y axes. There are no interior grid lines.
+1. Candidate Boundary Overlay: a compact view of the original image with every candidate polygon drawn over its source content.
+2. Enlarged Coordinate Boundary Overlay: a higher-resolution enlarged view with the same candidate polygons plus external numeric 0–100 X/Y axes. There are no interior grid lines.
 
-Each boundary is labeled with its region ID and group. A blue boundary is a rectangular keep candidate. A purple boundary is an exact polygon candidate; its thin blue rectangle is only the required bounding box. A red boundary is a deletion candidate. Orange rectangles are internal holes/cutouts. All colored lines, labels, axes, and outer padding are review overlays, not document content.
+Each candidate is labeled with its region ID and group and is shown by one colored polygon only. Purple polygons are keep candidates; red polygons are deletion candidates; orange polygons are internal holes/cutouts. There are no candidate rectangles or bbox outlines. All colored lines, labels, axes, and outer padding are review overlays, not document content.
 
-Cross-reference both images. Return the complete corrected set of regions, not a partial diff. Preserve semantic completeness and content-edge completeness: every visible stroke, punctuation mark, caption, chemical bond, arrow, sub/superscript, table border, image edge, and correction must remain inside an appropriate region. Do not include overlay lines, IDs, coordinate axes, tick labels, outer padding, decorative lines, headers, footers, or blank whitespace as content.
+Cross-reference both images. Return the complete corrected set of regions, not a partial diff. Preserve semantic completeness and content-edge completeness: every visible stroke, punctuation mark, caption, chemical bond, arrow, sub/superscript, table border, image edge, and correction must remain inside an appropriate region. A polygon must not touch or cross source ink; leave a visible white safety band inside its perimeter. Do not include overlay lines, IDs, coordinate axes, tick labels, outer padding, decorative lines, headers, footers, or blank whitespace as content.
 
 SUPERVISION RULES
 1. Every independently editable/readable item must be represented. Do not omit small captions, question numbers, formulas, or annotations.
-2. Keep chemical equations, reaction pathways, mechanisms, arrows, reactants, intermediates, products, conditions, catalysts, and connected labels as one semantically complete block. Never split a mechanism or reaction in the middle.
-3. A boxed, circled, crossed-out, or struck-through item must be a separate region with editAction="delete". A nearby correction or replacement must be a separate region. If an outer region contains an internal deletion, keep the outer region and use absolute original-image coordinates in holes.
-4. Use polygon for triangular or irregular content when a rectangle would include unrelated material. The bounding box must still fully contain the content.
-5. Read precise values from the enlarged coordinate overlay, but calculate every coordinate against the original inner image, not the enlarged canvas or its outer axes. Enforce 0<=x,y,w,h<=100, x+w<=100, y+h<=100. Round x/y/w/h to exactly two decimal places; polygon points and hole coordinates are also percentages.
+2. Keep chemical equations, reaction pathways, mechanisms, arrows, reactants, intermediates, products, conditions, catalysts, and connected labels as one semantically complete block. Never split a mechanism or reaction in the middle. Check each chemistry polygon at high magnification against the original: it must include every atom/element label, implicit or explicit bond endpoint, ring bond, charge, isotope/subscript/superscript, stereochemical wedge/dash, curved arrow and arrowhead, reaction arrow and arrowhead, plus/minus sign, reagent, solvent, temperature/pressure/catalyst label, yield, and detached condition belonging to the sequence. The polygon boundary must sit visibly outside all this ink; target at least 1.5% of original-image width and height as white clearance where possible. If any chemical mark touches or nearly touches an edge, mark revise and expand that polygon. Do not trade completeness for a tight silhouette.
+3. A circled, crossed-out, or struck-through item must be a separate region with editAction="delete". A nearby correction or replacement must be a separate region. If an outer region contains an internal deletion, keep the outer region and use an absolute-coordinate polygon in holes.
+4. Every region MUST use a polygon as its complete cutting boundary. Follow the visible content silhouette with enough points for angled, curved, or notched shapes, but keep every boundary outside source ink with safety clearance; do not default to four-corner boxes. Every hole MUST also be a polygon and must leave clearance around removed ink without erasing adjacent marks. Never output a rectangle, bbox, or x/y/w/h fields for either regions or holes.
+5. Read precise values from the enlarged coordinate overlay, but calculate every polygon point against the original inner image, not the enlarged canvas or its outer axes. Every point is an [x,y] pair in [0,100]. Use at least three points for each region/hole and round points to exactly two decimal places.
 6. If status is pass, issues must be []. If status is revise, issues must briefly identify the remaining defects. In both cases regions must be the complete final region list.
 
 CANDIDATE REGIONS
-""" + json.dumps(current, ensure_ascii=False) + """
+""" + json.dumps(model_visible_regions(current), ensure_ascii=False) + """
 
 OUTPUT SCHEMA & FORMATTING RULES
 You MUST output a single valid JSON object matching the exact structure below. Do not use markdown backticks, code blocks, or conversational text. Output only raw JSON.
@@ -562,16 +556,12 @@ You MUST output a single valid JSON object matching the exact structure below. D
       "id": "r1",
       "label": "Reaction Pathway A",
       "kind": "chemical",
-      "x": 12.50,
-      "y": 8.20,
-      "w": 34.00,
-      "h": 21.50,
+      "polygon": [[12.50,8.20],[28.00,6.80],[46.50,8.20],[42.00,21.00],[39.00,29.70],[15.00,29.70]],
       "confidence": 0.95,
       "group": "Q1",
       "description": "Complete reaction with catalyst labels",
       "editAction": "keep",
-      "polygon": null,
-      "holes": null
+      "holes": [{"polygon": [[20.00,15.00],[26.00,14.00],[30.00,16.00],[28.00,20.00],[22.00,21.00]]}]
     }
   ]
 }
@@ -579,9 +569,82 @@ You MUST output a single valid JSON object matching the exact structure below. D
 SERIALIZATION CONSTRAINTS
 - status is exactly "pass" or "revise". kind is exactly one of ["text","image","formula","table","diagram","chemical","annotation","other"]. editAction is exactly "keep" or "delete". confidence is a number from 0.00 through 1.00.
 - Candidate values from the first agent use chemistry/biology; serialize these as chemical/diagram in your response so the output always follows the supervisor enum.
-- polygon and holes are conditional: omit them, or use null, when not needed. Do not emit empty arrays for these fields.
-- Every region must include id, label, kind, x, y, w, h, confidence, group, description, and editAction. Use editAction="keep" for ordinary content and "delete" only for explicit deletion/cross-out content.
+- polygon is required and must contain at least three [x,y] pairs tracing the actual content boundary; do not default to four-corner boxes. It is the only region boundary; never emit x/y/w/h or bbox. holes is optional and, when present, must be an array of objects containing polygon point arrays only. Never encode a hole as x/y/w/h. Omit holes or use null when no internal exclusion is needed; do not emit empty arrays.
+- Every region must include id, label, kind, polygon, confidence, group, description, and editAction. Use editAction="keep" for ordinary content and "delete" only for explicit deletion/cross-out content.
 - No extra fields. No markdown, comments, explanations, trailing commas, or partial region lists. Escape strings correctly and ensure the result starts with { and ends with }."""
+
+
+def valid_polygon_points(points: Any) -> bool:
+    return (
+        isinstance(points, list)
+        and len(points) >= 3
+        and all(
+            isinstance(point, list)
+            and len(point) == 2
+            and all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and 0 <= float(value) <= 100
+                for value in point
+            )
+            for point in points
+        )
+    )
+
+
+def validate_segmentation_response(payload: Any) -> list[str]:
+    """Enforce polygon-only geometry in both splitter turns."""
+
+    if not isinstance(payload, dict):
+        return ["Splitter output must be one JSON object"]
+    violations: list[str] = []
+    if set(payload) != {"regions"}:
+        violations.append("Splitter output must contain only regions")
+    regions = payload.get("regions")
+    if not isinstance(regions, list) or not regions:
+        return violations + ["regions must be a non-empty complete array"]
+    if len(regions) > 80:
+        violations.append("regions cannot exceed 80 items")
+    required = {"id", "label", "kind", "polygon", "group"}
+    allowed = required | {"description", "editAction", "holes"}
+    kinds = {"text", "image", "table", "chemistry", "biology", "formula", "other"}
+    ids: set[str] = set()
+    for index, region in enumerate(regions[:80]):
+        prefix = f"regions[{index}]"
+        if not isinstance(region, dict):
+            violations.append(f"{prefix} must be an object")
+            continue
+        missing = required - set(region)
+        extras = set(region) - allowed
+        if missing:
+            violations.append(f"{prefix} missing: " + ", ".join(sorted(missing)))
+        if extras:
+            violations.append(f"{prefix} has forbidden or extra fields: " + ", ".join(sorted(extras)))
+        for key in ("id", "label", "group"):
+            if not isinstance(region.get(key), str) or not region[key].strip():
+                violations.append(f"{prefix}.{key} must be a non-empty string")
+        if isinstance(region.get("id"), str):
+            if region["id"] in ids:
+                violations.append(f"{prefix}.id must be unique")
+            ids.add(region["id"])
+        if region.get("kind") not in kinds:
+            violations.append(f"{prefix}.kind is outside the enum")
+        if "description" in region and not isinstance(region["description"], str):
+            violations.append(f"{prefix}.description must be a string")
+        if region.get("editAction") not in {None, "keep", "delete"}:
+            violations.append(f"{prefix}.editAction is outside the enum")
+        if not valid_polygon_points(region.get("polygon")):
+            violations.append(f"{prefix}.polygon must contain valid [x,y] points")
+        holes = region.get("holes")
+        if holes is not None:
+            if not isinstance(holes, list) or not holes:
+                violations.append(f"{prefix}.holes must be a non-empty array when present")
+            else:
+                for hole_index, hole in enumerate(holes):
+                    if not isinstance(hole, dict) or set(hole) != {"polygon"} or not valid_polygon_points(hole.get("polygon")):
+                        violations.append(f"{prefix}.holes[{hole_index}] must contain only a valid polygon")
+    return violations[:12]
 
 
 def validate_supervision_response(payload: Any) -> list[str]:
@@ -609,8 +672,8 @@ def validate_supervision_response(payload: Any) -> list[str]:
         issues.append("regions must be a non-empty complete array")
         return issues
 
-    required = {"id", "label", "kind", "x", "y", "w", "h", "confidence", "group", "description", "editAction"}
-    allowed = required | {"polygon", "holes"}
+    required = {"id", "label", "kind", "polygon", "confidence", "group", "description", "editAction"}
+    allowed = required | {"holes"}
     kinds = {"text", "image", "formula", "table", "diagram", "chemical", "annotation", "other"}
     for index, region in enumerate(regions[:80]):
         prefix = f"regions[{index}]"
@@ -633,25 +696,11 @@ def validate_supervision_response(payload: Any) -> list[str]:
         confidence = region.get("confidence")
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1:
             issues.append(f"{prefix}.confidence must be between 0 and 1")
-        coordinates: dict[str, float] = {}
-        for key in ("x", "y", "w", "h"):
-            value = region.get(key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                issues.append(f"{prefix}.{key} must be a finite number")
-                continue
-            coordinates[key] = float(value)
-            if not 0 <= coordinates[key] <= 100:
-                issues.append(f"{prefix}.{key} is outside 0-100")
-        if len(coordinates) == 4 and (coordinates["x"] + coordinates["w"] > 100 or coordinates["y"] + coordinates["h"] > 100):
-            issues.append(f"{prefix} bounding box exceeds the original image")
         polygon = region.get("polygon")
-        if polygon is not None and (not isinstance(polygon, list) or len(polygon) < 3):
-            issues.append(f"{prefix}.polygon must be null, omitted, or contain at least three points")
-        elif isinstance(polygon, list):
-            for point in polygon:
-                if not isinstance(point, list) or len(point) != 2 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0 <= float(value) <= 100 for value in point):
-                    issues.append(f"{prefix}.polygon contains an invalid point")
-                    break
+        if not isinstance(polygon, list) or len(polygon) < 3:
+            issues.append(f"{prefix}.polygon must contain at least three points")
+        elif not valid_polygon_points(polygon):
+            issues.append(f"{prefix}.polygon contains an invalid point")
         holes = region.get("holes")
         if holes is not None and not isinstance(holes, list):
             issues.append(f"{prefix}.holes must be null, omitted, or an array")
@@ -659,16 +708,11 @@ def validate_supervision_response(payload: Any) -> list[str]:
             if not holes:
                 issues.append(f"{prefix}.holes must be null or omitted when empty")
             for hole in holes:
-                if not isinstance(hole, dict) or set(hole) != {"x", "y", "w", "h"}:
+                if not isinstance(hole, dict) or set(hole) != {"polygon"}:
                     issues.append(f"{prefix}.holes contains an invalid object")
                     break
-                try:
-                    hx, hy, hw, hh = (float(hole[key]) for key in ("x", "y", "w", "h"))
-                    if not all(math.isfinite(value) and 0 <= value <= 100 for value in (hx, hy, hw, hh)) or hx + hw > 100 or hy + hh > 100:
-                        issues.append(f"{prefix}.holes contains out-of-range coordinates")
-                        break
-                except (TypeError, ValueError):
-                    issues.append(f"{prefix}.holes coordinates must be numbers")
+                if not valid_polygon_points(hole.get("polygon")):
+                    issues.append(f"{prefix}.holes contains an invalid polygon")
                     break
     return issues[:12]
 
@@ -690,6 +734,9 @@ def revise_regions(
     parsed, error = qwen_request(revision_images, prompt, history=history)
     if not parsed:
         return None, error or "分割 Agent 修改失败"
+    schema_issues = validate_segmentation_response(parsed)
+    if schema_issues:
+        return None, "分割 Agent 返回了非多边形或无效结构：" + "; ".join(schema_issues[:4])
     proposal = parsed.get("regions", []) if isinstance(parsed, dict) else []
     if not isinstance(proposal, list) or not proposal:
         return None, "分割 Agent 修改结果没有完整 regions"
@@ -722,7 +769,7 @@ def supervise_regions(
     splitter_history = list(segmentation_history or [])
     # Keep retrying until the supervisor passes, with a conservative hard cap
     # so a malformed model response cannot create an unbounded bill/loop.
-    max_rounds = max(1, min(6, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "5"))))
+    max_rounds = max(1, min(10, int(os.environ.get("QWEN_SUPERVISOR_ROUNDS", "10"))))
     for round_number in range(1, max_rounds + 1):
         review_prompt = supervision_prompt(current)
         try:
@@ -778,6 +825,10 @@ def prepare_qwen(image_data_url: str, hint: str = "") -> tuple[list[dict[str, An
     if not parsed:
         print(f"Qwen request failed, using offline layout: {error}")
         return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [error or "初次分割失败"]}, None
+    schema_issues = validate_segmentation_response(parsed)
+    if schema_issues:
+        message = "初次分割结果未遵守纯多边形格式：" + "; ".join(schema_issues[:4])
+        return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": [message]}, None
     proposal = parsed.get("regions", []) if isinstance(parsed, dict) else []
     if not isinstance(proposal, list) or not proposal:
         return heuristic_regions(), "offline", {"status": "error", "rounds": 0, "issues": ["Qwen response contained no regions"]}, None
@@ -890,21 +941,11 @@ def normalize_holes(raw: Any, precision: int = 2) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return holes
     for hole in raw[:24]:
-        if isinstance(hole, dict) and all(key in hole for key in ("x", "y", "w", "h")):
-            try:
-                x = max(0, min(100, float(hole["x"])))
-                y = max(0, min(100, float(hole["y"])))
-                w = max(0, min(100 - x, float(hole["w"])))
-                h = max(0, min(100 - y, float(hole["h"])))
-                if w and h:
-                    holes.append({
-                        "x": round(x, precision),
-                        "y": round(y, precision),
-                        "w": round(w, precision),
-                        "h": round(h, precision),
-                    })
-            except (TypeError, ValueError):
-                continue
+        if not isinstance(hole, dict):
+            continue
+        points = normalize_points(hole.get("polygon"), precision)
+        if len(points) >= 3:
+            holes.append({"polygon": points})
     return holes
 
 
@@ -916,10 +957,9 @@ def normalize_regions(
 ) -> list[dict[str, Any]]:
     """Validate model JSON and convert both agent schemas to editor regions.
 
-    The segmentation agent uses chemistry/biology while the supervisor uses
-    chemical/diagram/annotation. Both documented enums are preserved so the
-    API output continues to match the producing agent's schema. Unknown keys
-    are intentionally discarded.
+    The model-facing contract is polygon-only. Editor x/y/w/h values are
+    derived from polygon extrema for crop sizing and compatibility, never read
+    as model-provided region geometry. Unknown model keys are discarded.
     """
 
     kind_map = {
@@ -940,19 +980,15 @@ def normalize_regions(
         if not isinstance(region, dict):
             continue
         try:
-            bbox = region.get("bbox") if isinstance(region.get("bbox"), list) else None
-            if bbox and len(bbox) >= 4:
-                raw_x, raw_y = bbox[0], bbox[1]
-                raw_w, raw_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            elif all(key in region for key in ("x", "y", "w", "h")):
-                raw_x, raw_y, raw_w, raw_h = (region[key] for key in ("x", "y", "w", "h"))
-            else:
+            raw_polygon = normalize_points(region.get("polygon"), precision)
+            if len(raw_polygon) < 3:
                 continue
-            scale = 0.1 if max(abs(float(raw_x or 0)), abs(float(raw_y or 0)), abs(float(raw_w or 0)), abs(float(raw_h or 0))) > 100 else 1
-            x = max(0, min(100, float(raw_x) * scale))
-            y = max(0, min(100, float(raw_y) * scale))
-            w = min(100 - x, float(raw_w) * scale)
-            h = min(100 - y, float(raw_h) * scale)
+            x = min(point[0] for point in raw_polygon)
+            y = min(point[1] for point in raw_polygon)
+            right = max(point[0] for point in raw_polygon)
+            bottom = max(point[1] for point in raw_polygon)
+            w = right - x
+            h = bottom - y
             if w <= 0 or h <= 0:
                 continue
             raw_kind = str(region.get("kind") or "other").strip().lower()
@@ -983,13 +1019,11 @@ def normalize_regions(
             action = str(region.get("editAction") or "").strip().lower()
             if action == "delete" or (include_keep_action and action == "keep"):
                 item["editAction"] = action
-            polygon = normalize_points(region.get("polygon"), precision)
-            if polygon:
-                max_x, max_y = x + w, y + h
-                item["polygon"] = [
-                    [round(max(x, min(max_x, px)), precision), round(max(y, min(max_y, py)), precision)]
-                    for px, py in polygon
-                ]
+            max_x, max_y = x + w, y + h
+            item["polygon"] = [
+                [round(max(x, min(max_x, px)), precision), round(max(y, min(max_y, py)), precision)]
+                for px, py in raw_polygon
+            ]
             holes = normalize_holes(region.get("holes"), precision)
             if holes:
                 item["holes"] = holes

@@ -1110,42 +1110,81 @@ async function buildExportHtml() {
   }
   setProcessingStatus("正在按终端画布顺序整理集合分页…");
   entries.sort((a, b) => (a.region.layoutY || 0) - (b.region.layoutY || 0) || (a.region.layoutX || 0) - (b.region.layoutX || 0) || a.order - b.order);
-  // A collection occupies one page. Collection order follows its first appearance
-  // on the long terminal canvas, while blocks inside it retain their canvas coords.
+  // Collections are indivisible flow units. They keep their internal terminal-
+  // canvas arrangement, but several collections may share one page. A page break
+  // is inserted only before the next collection would cross the page bottom.
   const collections = new Map();
   entries.forEach((entry) => {
     if (!collections.has(entry.group)) collections.set(entry.group, []);
     collections.get(entry.group).push(entry);
   });
-  const pageGroups = [...collections.values()];
   const size = $("#pageSize").value;
   const dimensions = { a4: [794, 1123], a3: [1123, 1587], letter: [816, 1056] };
   const [pageWidth, pageHeight] = dimensions[size] || dimensions.a4;
   const pageMargin = clamp(Number($("#pageMargin").value), 0, Math.floor(Math.min(pageWidth, pageHeight) / 2));
-  const pagesHtml = pageGroups.map((items) => {
-    const groupTop = Math.min(...items.map((item) => item.region.layoutY || 0));
-    const groupBottom = Math.max(...items.map((item) => (item.region.layoutY || groupTop) + (item.region.layoutH || 1)));
-    const groupLeft = Math.min(...items.map((item) => Number.isFinite(item.region.layoutX) ? item.region.layoutX : 28));
-    const groupRight = Math.max(...items.map((item) => (Number.isFinite(item.region.layoutX) ? item.region.layoutX : 28) + (item.region.layoutW || 1)));
-    const contentWidth = Math.max(1, groupRight - groupLeft), contentHeight = Math.max(1, groupBottom - groupTop);
-    const pageScale = Math.min(1, (pageWidth - pageMargin * 2) / contentWidth, (pageHeight - pageMargin * 2) / contentHeight);
-    const groupHeight = Math.max(1, contentHeight * pageScale + pageMargin * 2);
-    const blocksHtml = items.map((item) => {
-      const region = item.region;
-      const left = Math.max(0, Math.round(((Number.isFinite(region.layoutX) ? region.layoutX : 28) - groupLeft) * pageScale + pageMargin));
-      const top = Math.max(0, Math.round(((Number.isFinite(region.layoutY) ? region.layoutY : groupTop) - groupTop) * pageScale + pageMargin));
-      const width = Math.max(1, Math.round((Number.isFinite(region.layoutW) ? region.layoutW : 1) * pageScale));
-      const height = Math.max(1, Math.round((Number.isFinite(region.layoutH) ? region.layoutH : 1) * pageScale));
-      return '<article class="print-block" style="left:' + left + 'px;top:' + top + 'px;width:' + width + 'px;height:' + height + 'px"><img src="' + escapeHtml(item.src) + '" alt="' + escapeHtml(region.label || '') + '" style="width:' + width + 'px;height:' + height + 'px" /></article>';
+  const usableWidth = Math.max(1, pageWidth - pageMargin * 2);
+  const usableHeight = Math.max(1, pageHeight - pageMargin * 2);
+  const canvasLeft = Math.min(...entries.map((entry) => Number.isFinite(entry.region.layoutX) ? entry.region.layoutX : 28));
+  const canvasRight = Math.max(...entries.map((entry) => {
+    const left = Number.isFinite(entry.region.layoutX) ? entry.region.layoutX : 28;
+    return left + (Number.isFinite(entry.region.layoutW) ? entry.region.layoutW : 1);
+  }));
+  const terminalWidth = Math.max(1, canvasRight - canvasLeft);
+  // Never enlarge a crop during export. A single horizontal scale keeps the
+  // terminal-canvas proportions consistent across all pages.
+  const terminalScale = Math.min(1, usableWidth / terminalWidth);
+  const groupGap = Math.max(0, Math.round(24 * terminalScale));
+  const units = [...collections.values()].map((items) => {
+    const groupTop = Math.min(...items.map((item) => Number.isFinite(item.region.layoutY) ? item.region.layoutY : 0));
+    const groupBottom = Math.max(...items.map((item) => {
+      const top = Number.isFinite(item.region.layoutY) ? item.region.layoutY : groupTop;
+      return top + (Number.isFinite(item.region.layoutH) ? item.region.layoutH : 1);
+    }));
+    const rawHeight = Math.max(1, groupBottom - groupTop);
+    // A single unusually tall collection still cannot be split. Reduce only
+    // that collection enough to fit the page; ordinary collections retain the
+    // terminal canvas size established above.
+    const scale = Math.min(terminalScale, usableHeight / rawHeight);
+    return { items, groupTop, height: Math.max(1, rawHeight * scale), scale, pageTop: 0 };
+  });
+  const pages = [];
+  let page = [];
+  let cursor = pageMargin;
+  for (const unit of units) {
+    const gap = page.length ? groupGap : 0;
+    if (page.length && cursor + gap + unit.height > pageHeight - pageMargin) {
+      pages.push(page);
+      page = [];
+      cursor = pageMargin;
+    }
+    unit.pageTop = cursor + (page.length ? groupGap : 0);
+    page.push(unit);
+    cursor = unit.pageTop + unit.height;
+  }
+  if (page.length) pages.push(page);
+
+  const pagesHtml = pages.map((pageItems) => {
+    const groupsHtml = pageItems.map((unit) => {
+      const { items, groupTop, scale, height } = unit;
+      const blocksHtml = items.map((item) => {
+        const region = item.region;
+        const left = Math.max(0, Math.round(pageMargin + ((Number.isFinite(region.layoutX) ? region.layoutX : canvasLeft) - canvasLeft) * scale));
+        const top = Math.max(0, Math.round(((Number.isFinite(region.layoutY) ? region.layoutY : groupTop) - groupTop) * scale));
+        const width = Math.max(1, Math.round((Number.isFinite(region.layoutW) ? region.layoutW : 1) * scale));
+        const blockHeight = Math.max(1, Math.round((Number.isFinite(region.layoutH) ? region.layoutH : 1) * scale));
+        return '<article class="print-block" style="left:' + left + 'px;top:' + top + 'px;width:' + width + 'px;height:' + blockHeight + 'px"><img src="' + escapeHtml(item.src) + '" alt="' + escapeHtml(region.label || '') + '" style="width:' + width + 'px;height:' + blockHeight + 'px" /></article>';
+      }).join('');
+      return '<div class="print-group" data-group="' + escapeHtml(items[0].group) + '" style="left:0;top:' + Math.round(unit.pageTop) + 'px;height:' + Math.ceil(height) + 'px">' + blocksHtml + '</div>';
     }).join('');
-    return '<section class="print-page"><div class="print-group" data-group="' + escapeHtml(items[0].group) + '" style="height:' + groupHeight + 'px">' + blocksHtml + '</div></section>';
+    return '<section class="print-page"><div class="print-page-content">' + groupsHtml + '</div></section>';
   }).join('');
-  setProcessingStatus("正在打开纯内容 PDF 预览（" + pageGroups.length + " 页）…");
+  setProcessingStatus("正在打开纯内容 PDF 预览（" + pages.length + " 页）…");
   const css = '@page{size:' + size + ' portrait;margin:0}' +
     '*{box-sizing:border-box}' +
     'html,body{margin:0;padding:0;background:#fff}' +
     '.print-page{width:' + pageWidth + 'px;height:' + pageHeight + 'px;min-height:' + pageHeight + 'px;margin:0;padding:0;overflow:hidden;background:#fff;page-break-after:always;break-after:page}' +
-    '.print-group{position:relative;width:' + pageWidth + 'px;margin:0;padding:0;break-inside:avoid;page-break-inside:avoid}' +
+    '.print-page-content{position:relative;width:' + pageWidth + 'px;height:' + pageHeight + 'px;margin:0;padding:0;overflow:hidden}' +
+    '.print-group{position:absolute;width:' + pageWidth + 'px;margin:0;padding:0;break-inside:avoid;page-break-inside:avoid}' +
     '.print-block{position:absolute;display:block;margin:0;padding:0;line-height:0;break-inside:avoid;page-break-inside:avoid}' +
     '.print-block img{display:block;max-width:none;max-height:none;object-fit:contain;object-position:left top;border:0;border-radius:0;background:#fff}' +
     '.print-overlays{position:absolute;inset:0;z-index:20;pointer-events:none;overflow:visible}' +

@@ -214,6 +214,7 @@ def _draw_candidate_boundaries(
     width, height = max(1, right - left), max(1, bottom - top)
     line_width = max(3, round(max(width, height) / 600))
     font = _overlay_font(max(13, line_width * 4))
+    label_y = top + 8
 
     def point(px: Any, py: Any) -> tuple[int, int]:
         return (
@@ -232,7 +233,6 @@ def _draw_candidate_boundaries(
             if len(polygon) < 3:
                 continue
             draw.line(polygon + [polygon[0]], fill=polygon_color, width=line_width, joint="curve")
-            x0, y0 = polygon[0]
 
             for hole in region.get("holes") or []:
                 if not isinstance(hole, dict) or not isinstance(hole.get("polygon"), list) or len(hole["polygon"]) < 3:
@@ -248,11 +248,36 @@ def _draw_candidate_boundaries(
             text_box = draw.textbbox((0, 0), tag, font=font, stroke_width=1)
             tag_width = text_box[2] - text_box[0] + 10
             tag_height = text_box[3] - text_box[1] + 8
-            tag_x = max(left, min(right - tag_width, x0))
-            tag_y = y0 - tag_height if y0 - tag_height >= top else min(bottom - tag_height, y0 + line_width)
-            draw.text((tag_x + 2, tag_y + 2), tag, font=font, fill="white", stroke_width=2, stroke_fill=polygon_color)
+            # Every caller supplies an external white annotation gutter. Never
+            # clamp a tag into the image or polygon, even for edge-touching crops.
+            tag_x = right + 16
+            draw.rounded_rectangle((tag_x, label_y, tag_x + tag_width, label_y + tag_height), radius=3, fill=polygon_color)
+            draw.text((tag_x + 5 - text_box[0], label_y + 4 - text_box[1]), tag, font=font, fill="white")
+            label_y += tag_height + 8
         except (TypeError, ValueError):
             continue
+
+
+def _boundary_annotation_canvas(canvas: Any, proposal: list[dict[str, Any]], content_box: tuple[int, int, int, int]) -> Any:
+    """Reserve white space outside the source for all IDs and collection labels."""
+
+    left, top, right, bottom = content_box
+    line_width = max(3, round(max(right - left, bottom - top) / 600))
+    font = _overlay_font(max(13, line_width * 4))
+    draw = ImageDraw.Draw(canvas)
+    label_width, label_height = 0, 16
+    for index, region in enumerate(proposal[:80]):
+        if not isinstance(region.get("polygon"), list) or len(region["polygon"]) < 3:
+            continue
+        label = str(region.get("id") or f"r{index + 1}")
+        group = str(region.get("group") or "")
+        suffix = " DELETE" if str(region.get("editAction") or "").lower() == "delete" else " POLY"
+        bounds = draw.textbbox((0, 0), f"{label}{' / ' + group if group else ''}{suffix}", font=font, stroke_width=1)
+        label_width = max(label_width, bounds[2] - bounds[0] + 42)
+        label_height += bounds[3] - bounds[1] + 16
+    output = Image.new("RGB", (max(canvas.width, right + label_width), max(canvas.height, top + label_height)), "white")
+    output.paste(canvas, (0, 0))
+    return output
 
 
 def _coordinate_review_canvas(source: Any) -> tuple[Any, tuple[int, int, int, int]]:
@@ -318,11 +343,14 @@ def make_supervision_images(image_data_url: str, proposal: list[dict[str, Any]])
             target = (max(1, round(source.width * scale)), max(1, round(source.height * scale)))
             return source.copy() if target == source.size else source.resize(target, Image.Resampling.LANCZOS)
 
-        compact = resized(compact_scale)
-        _draw_candidate_boundaries(compact, proposal, (0, 0, compact.width, compact.height))
+        compact_source = resized(compact_scale)
+        compact_box = (0, 0, compact_source.width, compact_source.height)
+        compact = _boundary_annotation_canvas(compact_source, proposal, compact_box)
+        _draw_candidate_boundaries(compact, proposal, compact_box)
 
         enlarged = resized(enlarged_scale)
         coordinate_canvas, content_box = _coordinate_review_canvas(enlarged)
+        coordinate_canvas = _boundary_annotation_canvas(coordinate_canvas, proposal, content_box)
         _draw_candidate_boundaries(coordinate_canvas, proposal, content_box)
         return [_encode_review_image(compact), _encode_review_image(coordinate_canvas)]
     except Exception as exc:
@@ -450,20 +478,28 @@ def _agent_visual_inputs(
     return visual_inputs[:16]
 
 
-def agent_layout_prompt(regions: list[dict[str, Any]], canvas_width: int = 800) -> str:
+def agent_layout_prompt(regions: list[dict[str, Any]], canvas_width: int = 800, context: dict[str, Any] | None = None) -> str:
     """Prompt for Qwen's canvas arrangement agent."""
 
-    return """You are an automatic document layout agent for a semantic crop editor. Arrange the already-cropped content blocks on one continuous white canvas.
+    return """You are an automatic document layout agent for a semantic crop editor. This is ONE STEP of a sequential material-by-material layout. Arrange ONLY the supplied editable blocks from the current material on one continuous white canvas.
 
 The source blocks are already semantically segmented. Do not change their crop polygons, source coordinates, labels, kinds, or collection membership. Only choose their canvas x/y positions and their order.
 
 LAYOUT RULES
 1. Use CSS-pixel coordinates. The usable canvas width is """ + str(canvas_width) + """ px and vertical space is unlimited.
 2. Keep every supplied width and height exactly unchanged. Never scale a block, enlarge a block, or rotate a block.
-3. Blocks in the same group form one readable collection. Keep that collection contiguous, in a natural top-to-bottom reading order, with a modest gap between collections.
+3. Blocks in the same group form one readable collection. Keep that collection contiguous, in a natural top-to-bottom reading order, with 12 px between blocks and 16 px between collections. Use side-by-side space when the content and unchanged widths permit it.
 4. Avoid overlap between unrelated blocks. Keep chemistry equations, mechanisms, figures, captions, and their related text together when their group says they belong together.
-5. Preserve the current order as a strong hint, but repair obvious collisions, excessive whitespace, and blocks placed outside the canvas. Keep x >= 24 and y >= 24.
-6. Return every input block exactly once. Do not invent or remove IDs. The array order is the final front-to-back/read order.
+5. Previous materials in fixedBlocks are already placed and must not move. Avoid their occupied rectangles. Later, pending materials are staging content and will be repositioned by the editor after this step; they are NOT fixed obstacles. Start near the end of the fixed content, filling available space in its final collection if the group matches. Never preserve a large blank gap merely because a pending source is far down the old canvas. Keep x >= 24, y >= 24, and x + the fixed width <= canvas width.
+6. Return every editable input block exactly once. Do not invent or remove IDs or return fixed/pending blocks. order is their final reading order.
+7. The editor will resolve collisions and compact unnecessary blank gaps while preserving sizes and your proposed reading order. The next request receives a freshly rendered PDF layout after your result has been applied.
+
+IMAGE GUIDE
+The pdf-page images are clean raster renders from the EXACT SAME page layout used by PDF export, including current crops, polygon holes, and per-block whiteouts. They contain no editor UI, boundary labels, or vertex marks. Use the supplied page manifest to map their page-pixel rectangles to region IDs. Page coordinates are NOT canvas coordinates: pagination, group relocation, and per-group scaling are described in the manifest. Output x/y in CANVAS CSS pixels only.
+The crop-sheet images show the current material's edited crops separately at readable resolution, even if some content overlaps or is tiny on a PDF page. Their ID/collection labels sit in a separate header outside the crop. They are reference sheets, NOT a proposed layout. Read them for semantics and use each block's fixed layoutW/layoutH for placement.
+
+CURRENT STEP AND FIXED CANVAS CONTEXT
+""" + json.dumps(context or {}, ensure_ascii=False) + """
 
 INPUT BLOCKS
 """ + json.dumps(regions, ensure_ascii=False) + """
@@ -596,6 +632,9 @@ def _agent_request_regions(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "group": str(raw.get("group") or "")[:80],
             "description": str(raw.get("description") or "")[:160],
             "polygon": raw.get("polygon") if isinstance(raw.get("polygon"), list) else None,
+            "holes": raw.get("holes") if isinstance(raw.get("holes"), list) else [],
+            "editAction": raw.get("editAction", "keep"),
+            "x": raw.get("x", 0), "y": raw.get("y", 0), "w": raw.get("w", 100), "h": raw.get("h", 100),
             "layoutX": raw.get("layoutX", 0),
             "layoutY": raw.get("layoutY", 0),
             "layoutW": raw.get("layoutW", 1),
@@ -625,18 +664,38 @@ def _agent_request_images(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return images
 
 
+def _agent_layout_views(payload: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Accept fresh PDF rasters and unoccluded edited crop sheets for one step."""
+
+    views = payload.get("layoutViews")
+    if not isinstance(views, list) or not views:
+        raise ValueError("自动排版需要当前 PDF 排版图和素材裁剪参考图")
+    images, manifest = [], []
+    for view in views:
+        if not isinstance(view, dict) or view.get("kind") not in {"pdf-page", "crop-sheet"}:
+            raise ValueError("排版参考图类型无效")
+        image = view.get("image")
+        if not isinstance(image, str) or not image.startswith("data:image/"):
+            raise ValueError("排版参考图必须为图片")
+        images.append(image)
+        manifest.append({key: view[key] for key in ("kind", "pageIndex", "width", "height", "blocks") if key in view})
+    if not any(view["kind"] == "pdf-page" for view in manifest) or not any(view["kind"] == "crop-sheet" for view in manifest):
+        raise ValueError("自动排版必须同时提供 PDF 排版图和裁剪参考图")
+    return images, manifest
+
+
 def run_agent_operation(payload: dict[str, Any], operation: str) -> tuple[dict[str, Any] | None, int, str | None]:
     """Execute one of the two Qwen 3.8 flash editor agents."""
 
     regions = _agent_request_regions(payload)
-    images = _agent_request_images(payload)
-    visual_inputs = _agent_visual_inputs(images, regions)
-    visual_manifest = [
-        {"imageId": image["id"], "name": image["name"], "views": ["compact boundary overlay", "enlarged 0-100 coordinate overlay"]}
-        for image in images
-    ]
     if operation == "layout":
-        prompt = agent_layout_prompt(regions, int(payload.get("canvasWidth") or 800)) + "\n\nVISUAL INPUT ORDER\n" + json.dumps(visual_manifest, ensure_ascii=False)
+        if len({region["imageId"] for region in regions}) != 1:
+            raise ValueError("每次自动排版只能处理一张素材")
+        visual_inputs, visual_manifest = _agent_layout_views(payload)
+        context = payload.get("layoutContext")
+        if not isinstance(context, dict):
+            raise ValueError("自动排版缺少当前步骤信息")
+        prompt = agent_layout_prompt(regions, int(payload.get("canvasWidth") or 800), context) + "\n\nVISUAL INPUT ORDER\n" + json.dumps(visual_manifest, ensure_ascii=False)
         parsed, error = qwen_request(visual_inputs, prompt, model=QWEN_MODEL)
         if error:
             return None, 502, "自动排版请求失败：" + error
@@ -645,6 +704,12 @@ def run_agent_operation(payload: dict[str, Any], operation: str) -> tuple[dict[s
             return None, 422, "自动排版返回格式无效：" + issues[0]
         return {"placements": parsed["placements"], "model": QWEN_MODEL, "source": "qwen-agent"}, 200, None
     if operation == "renumber":
+        images = _agent_request_images(payload)
+        visual_inputs = _agent_visual_inputs(images, regions)
+        visual_manifest = [
+            {"imageId": image["id"], "name": image["name"], "views": ["source polygons with external ID/group legend", "enlarged 0-100 coordinates with the same external legend"]}
+            for image in images
+        ]
         prompt = agent_renumber_prompt(regions) + "\n\nVISUAL INPUT ORDER\n" + json.dumps(visual_manifest, ensure_ascii=False)
         parsed, error = qwen_request(visual_inputs, prompt, model=QWEN_MODEL)
         if error:
@@ -844,7 +909,7 @@ You receive exactly two aligned images containing the same current candidate reg
 1. Candidate Boundary Overlay: the original image at a compact scale with every current polygon boundary drawn over the source content.
 2. Enlarged Coordinate Boundary Overlay: an enlarged view with the same polygon boundaries plus external numeric 0–100 X/Y axes. There are no interior grid lines.
 
-Every candidate is outlined by one colored polygon and labeled with its region ID and group. Purple polygons are keep candidates; red polygons are deletion candidates; orange polygons are internal holes/cutouts. There are no candidate rectangles or bbox outlines in either image. All colored lines, labels, axes, and outer padding are review overlays, not source content. No separate clean original image is supplied in this revision turn.
+Every candidate is outlined by one colored polygon. Its region ID and group are listed in the external white legend to the right of the source image, in the same order as the supplied region list; use the polygon coordinates to match them. The legend is outside the original inner image and is never part of the 0–100 coordinate range. Purple polygons are keep candidates; red polygons are deletion candidates; orange polygons are internal holes/cutouts. There are no candidate rectangles or bbox outlines in either image. All colored lines, labels, axes, and outer padding are review overlays, not source content. No separate clean original image is supplied in this revision turn.
 
 Revise the complete region list using the supervisor feedback below. Return every valid region, including unchanged regions; never return a partial diff. Read precise coordinate values from the enlarged coordinate overlay, but measure all percentages against the original inner image, not the enlarged canvas or outer axes. Preserve every content edge and each complete semantic unit. For every chemical structure/equation/mechanism, place the polygon outside the outermost ink with a visible white safety buffer (aim for at least 1.5% of original-image width and height where available); never let a vertex touch a bond, atom label, arrowhead, charge, isotope, stereomark, or condition. Expand clipped/tight chemistry boundaries even if this introduces a small amount of white space. Include every reactant, intermediate, product, bond endpoint, curved/reaction arrowhead, catalyst/reagent/solvent/temperature label, yield, and connected annotation in one complete semantic unit. Keep crossed-out content as a separate delete region, keep nearby corrections separate, and preserve internal deletions as absolute-coordinate polygon holes. Holes around chemical ink also need a white safety buffer and must not remove adjacent content. Use polygons for every region and every hole; never output rectangle fields for regions or holes.
 
@@ -896,7 +961,7 @@ You receive exactly two aligned images containing the same candidate regions:
 1. Candidate Boundary Overlay: a compact view of the original image with every candidate polygon drawn over its source content.
 2. Enlarged Coordinate Boundary Overlay: a higher-resolution enlarged view with the same candidate polygons plus external numeric 0–100 X/Y axes. There are no interior grid lines.
 
-Each candidate is labeled with its region ID and group and is shown by one colored polygon only. Purple polygons are keep candidates; red polygons are deletion candidates; orange polygons are internal holes/cutouts. There are no candidate rectangles or bbox outlines. All colored lines, labels, axes, and outer padding are review overlays, not document content.
+Each candidate is shown by one colored polygon only. Region IDs and group labels are in the external white legend to the right of the source, in the same order as the supplied region list; match them using polygon coordinates. The legend and all extra padding lie outside the original inner image and must never affect percentage coordinates. Purple polygons are keep candidates; red polygons are deletion candidates; orange polygons are internal holes/cutouts. There are no candidate rectangles or bbox outlines. All colored lines, labels, axes, and outer padding are review overlays, not document content.
 
 Cross-reference both images. Return the complete corrected set of regions, not a partial diff. Preserve semantic completeness and content-edge completeness: every visible stroke, punctuation mark, caption, chemical bond, arrow, sub/superscript, table border, image edge, and correction must remain inside an appropriate region. A polygon must not touch or cross source ink; leave a visible white safety band inside its perimeter. Do not include overlay lines, IDs, coordinate axes, tick labels, outer padding, decorative lines, headers, footers, or blank whitespace as content.
 

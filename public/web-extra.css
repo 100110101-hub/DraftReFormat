@@ -21,17 +21,17 @@
 .long-canvas #regionLayer { z-index: 3; }
 .long-canvas #paintLayer { z-index: 7; pointer-events: none; }
 .canvas-frame.painting #paintLayer { pointer-events: auto; cursor: crosshair; }
-.region-tile { position: absolute; overflow: hidden; border: 1px solid #d5dbe4; border-radius: 3px; background: #fff; box-shadow: 0 3px 11px rgba(45, 53, 67, .10); cursor: grab; transition: box-shadow .14s, border-color .14s; z-index: 2; }
+.region-tile { position: absolute; overflow: visible; border: 1px solid #d5dbe4; border-radius: 3px; background: #fff; box-shadow: 0 3px 11px rgba(45, 53, 67, .10); cursor: grab; transition: box-shadow .14s, border-color .14s; z-index: 2; }
 .region-tile.crop-preview-pending { display: grid; place-items: center; border-style: dashed; border-color: #c5cad4; box-shadow: none; }
 .region-tile.crop-preview-pending::after { content: "正在生成裁切预览"; color: #7e8795; background: rgba(255,255,255,.92); border-radius: 3px; padding: 4px 6px; font: 10px/1.2 sans-serif; }
 .region-tile:hover, .region-tile.selected { border-color: #8a75ea !important; box-shadow: 0 0 0 2px rgba(133, 117, 255, .18), 0 7px 19px rgba(45, 53, 67, .16); }
 .region-tile:active { cursor: grabbing; }
 .region-tile > img { display: block; width: 100%; height: 100%; object-fit: contain; object-position: left top; user-select: none; pointer-events: none; background: #fff; }
-.tile-label { position: absolute; top: 7px; left: 7px; right: 7px; display: flex; justify-content: space-between; align-items: center; gap: 7px; pointer-events: none; opacity: 0; transition: opacity .14s; }
+.tile-label { position: absolute; bottom: calc(100% + 8px); left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; gap: 7px; pointer-events: none; opacity: 0; transition: opacity .14s; }
 .region-tile:hover .tile-label, .region-tile.selected .tile-label { opacity: 1; }
 .tile-label span { color: #fff; background: rgba(32, 29, 61, .84); padding: 4px 6px; border-radius: 4px; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tile-label i { font-style: normal; color: #302c48; background: rgba(255,255,255,.87); padding: 3px 5px; border-radius: 4px; font-size: 8px; }
-.tile-kind { position: absolute; right: 7px; bottom: 6px; color: #5c6571; background: rgba(255,255,255,.82); padding: 2px 4px; border-radius: 3px; font-size: 7px; letter-spacing: .08em; pointer-events: none; opacity: 0; }
+.tile-kind { position: absolute; right: 0; top: calc(100% + 3px); color: #5c6571; background: rgba(255,255,255,.82); padding: 2px 4px; border-radius: 3px; font-size: 7px; letter-spacing: .08em; pointer-events: none; opacity: 0; }
 .region-tile:hover .tile-kind, .region-tile.selected .tile-kind { opacity: 1; }
 
 /* Keep both sidebars and the middle canvas in their own scroll contexts. */
@@ -69,16 +69,20 @@
 .inspector-panel, .output-panel { flex: 1 1 50%; min-height: 0; margin: 10px 10px 0; padding: 12px; border: 1px solid #2b323f; border-radius: 8px; background: rgba(19, 23, 32, .94); overflow-x: hidden; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #394151 transparent; }
 .output-panel { flex: 0 1 40%; min-height: 185px; margin-bottom: 10px; }
 .selected-preview::before, .selected-preview::after { display: none; }
-.selected-preview > svg { position: absolute; inset: 9px 22px 9px 9px; width: calc(100% - 31px); height: calc(100% - 18px); overflow: visible; }
+.selected-preview > svg { position: absolute; inset: 17px 42px 23px; width: calc(100% - 84px); height: calc(100% - 40px); overflow: visible; }
 .selected-preview .preview-polygon-fill { fill: rgba(177, 155, 255, .16); stroke: none; }
-.model-boundary-overlay, .preview-model-boundary { position: absolute; inset: 0; z-index: 5; width: 100%; height: 100%; overflow: hidden; pointer-events: none; }
+.model-boundary-overlay, .preview-model-boundary { position: absolute; inset: 0; z-index: 5; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .preview-model-boundary { z-index: 1; }
 .model-boundary-underlay, .model-boundary-line { fill: none; vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }
-.model-boundary-underlay { stroke: rgba(255,255,255,.98); stroke-width: 4; }
-.model-boundary-line { stroke: #e33449; stroke-width: 1.8; stroke-dasharray: 5 2.5; }
+.model-boundary-underlay { stroke: rgba(38,35,78,.94); stroke-width: 4; }
+.model-boundary-line { stroke: #36b7a8; stroke-width: 2; stroke-dasharray: 6 2.5; }
 .boundary-vertex { pointer-events: none; }
-.boundary-vertex circle { fill: #e33449; stroke: #fff; stroke-width: .8; vector-effect: non-scaling-stroke; }
-.boundary-vertex text { fill: #fff; stroke: rgba(26,20,31,.96); stroke-width: 1.8; paint-order: stroke; font: 700 8px/1 sans-serif; vector-effect: non-scaling-stroke; }
+.boundary-vertex circle { fill: none; stroke: #685dd0; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.boundary-label-leader { fill: none; stroke: #39346f; stroke-width: .6; vector-effect: non-scaling-stroke; }
+.model-boundary-overlay .boundary-callout { opacity: 0; }
+.region-tile:hover .boundary-callout, .region-tile.selected .boundary-callout { opacity: 1; }
+.boundary-label-bg { fill: rgba(43,39,91,.94); stroke: rgba(255,255,255,.94); stroke-width: .8; vector-effect: non-scaling-stroke; }
+.boundary-vertex text { fill: #fff; stroke: rgba(36,32,77,.95); stroke-width: 1.1; paint-order: stroke; font: 700 8px/1 sans-serif; vector-effect: non-scaling-stroke; }
 .model-boundaries-hidden .model-boundary-overlay, .model-boundaries-hidden .preview-model-boundary { display: none; }
 .boundary-toggle { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 66px; height: 29px; padding: 0 8px; border: 1px solid #343b49; border-radius: 5px; background: #171b23; color: #8690a0; cursor: pointer; }
 .boundary-toggle span { font-size: 12px; }

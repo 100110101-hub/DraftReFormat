@@ -190,19 +190,29 @@ function renderRegionBoundarySvg(region, targetWidth, targetHeight, className, v
   const polygons = [polygon, ...(region.holes || []).map((hole) => hole?.polygon).filter((points) => Array.isArray(points) && points.length >= 3)];
   const compensateX = targetWidth / Math.max(.001, Number(visualWidth) || targetWidth);
   const compensateY = targetHeight / Math.max(.001, Number(visualHeight) || targetHeight);
-  const geometry = polygons.map((points) => {
+  const rails = { left: [], right: [] };
+  const geometry = polygons.map((points, polygonIndex) => {
     const mapped = points.map(map).map(([x, y]) => [Number(x), Number(y)]);
     const coords = mapped.map((point) => point.map((value) => value.toFixed(3)).join(",")).join(" ");
-    const center = [mapped.reduce((sum, point) => sum + point[0], 0) / mapped.length, mapped.reduce((sum, point) => sum + point[1], 0) / mapped.length];
     const vertices = mapped.map(([x, y], index) => {
-      const placeLeft = x > center[0], placeBelow = y < center[1];
-      const labelX = placeLeft ? -5 : 5;
-      const labelY = placeBelow ? Math.min((Number(visualHeight) || targetHeight) * .42, 28) : -Math.min((Number(visualHeight) || targetHeight) * .42, 8);
-      return `<g class="boundary-vertex" transform="translate(${x.toFixed(3)} ${y.toFixed(3)})"><g transform="scale(${compensateX} ${compensateY})"><circle r="3"></circle><text x="${labelX}" y="${labelY}" text-anchor="${placeLeft ? "end" : "start"}">V${index + 1}</text></g></g>`;
+      const side = x < targetWidth / 2 ? "left" : "right";
+      rails[side].push({ x, y, label: polygonIndex ? `H${polygonIndex}V${index + 1}` : `V${index + 1}` });
+      return `<g class="boundary-vertex" transform="translate(${x.toFixed(3)} ${y.toFixed(3)})"><g transform="scale(${compensateX} ${compensateY})"><circle r="1.5"></circle></g></g>`;
     }).join("");
     return `<polygon class="model-boundary-underlay" points="${coords}"/><polygon class="model-boundary-line" points="${coords}"/>${vertices}`;
   }).join("");
-  return `<svg class="${className}" viewBox="0 0 ${targetWidth} ${targetHeight}" preserveAspectRatio="none" aria-hidden="true">${geometry}</svg>`;
+  const labels = Object.entries(rails).map(([side, vertices]) => {
+    let previousY = -Infinity;
+    return vertices.sort((a, b) => a.y - b.y).map(({ x, y, label }) => {
+      const labelWidth = 7 + label.length * 5.2;
+      const labelY = Math.max(y, previousY + 14 * compensateY);
+      previousY = labelY;
+      const labelX = side === "left" ? -(labelWidth + 6) * compensateX : targetWidth + 6 * compensateX;
+      // The whole badge stays beyond the crop bbox, even at concave/hole vertices.
+      return `<g class="boundary-callout"><path class="boundary-label-leader" d="M${x} ${y} L${side === "left" ? labelX + labelWidth * compensateX : labelX} ${labelY}"/><g class="boundary-vertex" transform="translate(${labelX} ${labelY}) scale(${compensateX} ${compensateY})"><rect class="boundary-label-bg" x="0" y="-7" width="${labelWidth}" height="12" rx="3"/><text x="3" y="2">${label}</text></g></g>`;
+    }).join("");
+  }).join("");
+  return `<svg class="${className}" viewBox="0 0 ${targetWidth} ${targetHeight}" preserveAspectRatio="none" aria-hidden="true">${geometry}${labels}</svg>`;
 }
 
 function updateBoundaryVisibility() {
@@ -1038,9 +1048,10 @@ async function segmentAll() {
   } finally { batchButton.disabled = false; batchButton.textContent = "批量分析素材队列"; }
 }
 
-function agentRegionsPayload() {
+function agentRegionsPayload(onlyImage = null) {
   const regions = [];
   state.images.forEach((image) => {
+    if (onlyImage && image !== onlyImage) return;
     const sourceRegions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
     sourceRegions.forEach((region) => {
       if (!region?.id) return;
@@ -1053,6 +1064,9 @@ function agentRegionsPayload() {
         group: region.group || "",
         description: region.description || "",
         polygon: Array.isArray(region.polygon) ? region.polygon : null,
+        holes: region.holes || [],
+        editAction: region.editAction || "keep",
+        x: region.x, y: region.y, w: region.w, h: region.h,
         layoutX: Number.isFinite(region.layoutX) ? region.layoutX : 28,
         layoutY: Number.isFinite(region.layoutY) ? region.layoutY : 28,
         layoutW: Number.isFinite(region.layoutW) ? region.layoutW : 1,
@@ -1100,31 +1114,162 @@ async function requestAgent(path, button, workingLabel, statusLabel) {
 
 async function autoLayoutWithAgent() {
   const button = $("#agentLayoutButton");
+  const renumberButton = $("#agentRenumberButton");
+  const previousLabel = button.innerHTML;
+  let finished = 0, total = 0;
+  if (state.agentLayoutRunning) return;
+  if (!state.images.length) return showToast("请先加入图片素材", "warn");
+  state.agentLayoutRunning = true;
+  button.disabled = true; renumberButton.disabled = true;
   try {
-    const result = await requestAgent("/api/agent-layout", button, "排版中…", "Qwen 正在按集合整理长画布…");
-    const placements = Array.isArray(result.placements) ? result.placements : [];
-    const byId = new Map(placements.map((placement) => [placement.id, placement]));
-    const ordered = [...placements].sort((a, b) => Number(a.order) - Number(b.order));
+    visualRegions();
+    await Promise.all(state.images.map(ensureImageMetrics));
+    normalizeLongLayout();
+    const images = state.images.filter((image) => layoutMaterialRegions(image).length);
+    total = images.length;
+    if (!total) throw new Error("没有可输出的内容块");
     pushHistory();
-    state.images.forEach((image) => {
-      const regions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
-      regions.forEach((region) => {
-        const placement = byId.get(region.id);
-        if (!placement) return;
-        region.layoutX = Math.max(8, Number(placement.x) || 8);
-        region.layoutY = Math.max(8, Number(placement.y) || 8);
-        region.zIndex = ordered.findIndex((item) => item.id === region.id) + 2;
-        region.userMoved = true;
+    const fixed = [];
+    reflowPendingMaterials(images, fixed);
+    for (const image of images) {
+      const step = finished + 1;
+      button.innerHTML = `<span class="spinner"></span>排版 ${step}/${total}`;
+      setProcessingStatus(`自动排版 ${step}/${total}：生成最新 PDF 排版图 · ${image.name}`);
+      const layoutViews = await buildLayoutViews(image, fixed);
+      const signature = layoutEditSignature();
+      setProcessingStatus(`自动排版 ${step}/${total}：Qwen 定位当前素材 · ${image.name}`);
+      const response = await fetch("/api/agent-layout", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          canvasWidth: 800,
+          regions: agentRegionsPayload(image).filter((region) => region.editAction !== "delete"),
+          layoutViews,
+          layoutContext: {
+            step, total, imageId: image.id, imageName: image.name,
+            fixedBlocks: fixed.map(({ image: source, region }) => ({ id: region.id, imageId: source.id, group: region.group, x: region.layoutX, y: region.layoutY, w: region.layoutW, h: region.layoutH })),
+            pendingImageIds: images.slice(step).map((pending) => pending.id),
+          },
+        }),
       });
-    });
-    captureHomePageLayout();
-    render();
-    setProcessingStatus(`Agent 自动排版完成（${placements.length} 个块）`);
-    showToast(`Qwen 已完成自动排版（${placements.length} 个块）`, "success");
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "排版请求失败");
+      if (layoutEditSignature() !== signature) throw new Error("请求期间素材或画布已修改，已停止应用过期排版，请重新运行");
+      const placements = result.placements;
+      const regions = layoutMaterialRegions(image);
+      if (!Array.isArray(placements) || placements.length !== regions.length || new Set(placements.map((item) => item.id)).size !== regions.length || placements.some((item) => !regions.some((region) => region.id === item.id) || item.imageId !== image.id)) throw new Error("排版返回的内容块不完整");
+      setProcessingStatus(`自动排版 ${step}/${total}：检查重叠、收紧空白并更新后续素材`);
+      applyCompactMaterialLayout(image, placements, fixed);
+      fixed.push(...regions.map((region) => ({ image, region })));
+      finished += 1;
+      reflowPendingMaterials(images.slice(finished), fixed);
+      updateMaterialHomeLayouts();
+      render();
+    }
+    setProcessingStatus(`Agent 自动排版完成（${finished} 张素材，${fixed.length} 个块）`);
+    showToast(`已逐张完成 ${finished} 张素材的排版`, "success");
   } catch (error) {
-    setProcessingStatus("Agent 自动排版未更改画布");
+    setProcessingStatus(`自动排版已停止：完成 ${finished}/${total} 张，可撤销本次排版`);
     showToast(error.message || "自动排版失败", "error");
+  } finally {
+    state.agentLayoutRunning = false;
+    button.disabled = false; renumberButton.disabled = false;
+    button.innerHTML = previousLabel;
   }
+}
+
+function layoutMaterialRegions(image) {
+  return (image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : [])).filter((region) => region.editAction !== "delete");
+}
+
+function layoutEditSignature() {
+  return JSON.stringify(state.images.map((image) => [image.id, image.src, (image.regions.length ? image.regions : [image.syntheticRegion]).map((region) => region && [region.id, region.group, region.label, region.editAction, region.polygon, region.holes, region.whiteoutPaths, region.whiteoutPolygons, region.layoutX, region.layoutY, region.layoutW, region.layoutH])]).concat([state.keepGroups, exportSettings()]));
+}
+
+function compactMaterialPlacements(regions, placements, fixed, canvasWidth = 800) {
+  const gap = 12, collectionGap = 16, margin = 24;
+  const byId = new Map(regions.map((region) => [region.id, region]));
+  const ordered = [...placements].sort((a, b) => a.order - b.order);
+  const groups = new Map();
+  ordered.forEach((placement) => {
+    const region = byId.get(placement.id);
+    if (!region) throw new Error("排版包含未知内容块");
+    const group = region.group && region.group !== "—" ? region.group : region.id;
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push({ region, placement });
+  });
+  const occupied = fixed.map(({ region }) => ({ x: region.layoutX, y: region.layoutY, w: region.layoutW, h: region.layoutH, group: region.group }));
+  const lastFixed = [...occupied].sort((a, b) => b.y + b.h - a.y - a.h)[0];
+  let floor = occupied.length ? Math.max(...occupied.map((rect) => rect.y + rect.h)) + collectionGap : margin;
+  const result = [];
+  for (const [group, items] of groups) {
+    if (!result.length && lastFixed?.group === group) floor = Math.min(...occupied.filter((rect) => rect.group === group).map((rect) => rect.y));
+    let previous = null, previousHintY = null;
+    for (const { region, placement } of items) {
+      const w = region.layoutW, h = region.layoutH, maxX = canvasWidth - w;
+      if (!(w > 0 && h > 0) || maxX < margin) throw new Error("内容块超出画布宽度，请先调整素材尺寸");
+      const preferredX = clamp(Number(placement.x) || margin, margin, maxX);
+      const preferredY = Math.max(floor, Number(placement.y) || floor);
+      const nextRow = previous && Number(placement.y) - previousHintY > Math.max(6, Math.min(h, previous.h) * .25);
+      const minY = nextRow ? previous.y + previous.h + gap : Math.max(floor, previous?.y || floor);
+      const xs = [...new Set([preferredX, margin, ...occupied.flatMap((rect) => [rect.x + rect.w + gap, rect.x - w - gap])].filter((x) => x >= margin && x <= maxX))];
+      const ys = [...new Set([minY, ...occupied.map((rect) => rect.y + rect.h + gap).filter((y) => y >= minY)])].sort((a, b) => a - b);
+      let best = null;
+      for (const y of ys) {
+        for (const x of xs) {
+          if (previous && y === previous.y && x < previous.x + previous.w + gap) continue;
+          if (occupied.some((rect) => x < rect.x + rect.w + gap && x + w + gap > rect.x && y < rect.y + rect.h + gap && y + h + gap > rect.y)) continue;
+          // Earliest legal row removes giant gaps; x/y hints break ties only.
+          const cost = Math.abs(x - preferredX) + Math.abs(y - preferredY) * .01;
+          if (!best || y < best.y || (y === best.y && cost < best.cost)) best = { id: region.id, x, y, w, h, group, cost, order: result.length };
+        }
+        if (best) break;
+      }
+      if (!best) throw new Error("无法找到不重叠的排版位置");
+      result.push(best); occupied.push(best); previous = best;
+      previousHintY = Number(placement.y) || 0;
+    }
+    floor = Math.max(...occupied.map((rect) => rect.y + rect.h)) + collectionGap;
+  }
+  return result;
+}
+
+function applyCompactMaterialLayout(image, placements, fixed) {
+  const regions = layoutMaterialRegions(image);
+  const compacted = compactMaterialPlacements(regions, placements, fixed);
+  const byId = new Map(compacted.map((item) => [item.id, item]));
+  regions.forEach((region) => {
+    const placement = byId.get(region.id);
+    region.layoutX = placement.x; region.layoutY = placement.y;
+    region.zIndex = fixed.length + placement.order + 2; region.userMoved = true;
+  });
+}
+
+function reflowPendingMaterials(images, fixed) {
+  const staged = [...fixed];
+  images.forEach((image) => {
+    const regions = layoutMaterialRegions(image);
+    const ordered = [...regions].sort((a, b) => a.layoutY - b.layoutY || a.layoutX - b.layoutX);
+    applyCompactMaterialLayout(image, ordered.map((region, order) => ({ id: region.id, x: region.layoutX, y: region.layoutY, order })), staged);
+    staged.push(...regions.map((region) => ({ image, region })));
+  });
+  // Deleted crops are excluded from PDF pages but remain editable on the canvas.
+  // Park them after visible content, so they cannot obscure pending materials.
+  let tail = staged.reduce((bottom, { region }) => Math.max(bottom, region.layoutY + region.layoutH), 24) + 16;
+  state.images.forEach((image) => image.regions.filter((region) => region.editAction === "delete").forEach((region) => {
+    region.layoutX = 24; region.layoutY = tail; region.userMoved = true;
+    tail += region.layoutH + 12;
+  }));
+  render();
+}
+
+function updateMaterialHomeLayouts() {
+  state.images.forEach((image) => {
+    const regions = image.regions.length ? image.regions : [image.syntheticRegion];
+    if (!regions.length || regions.some((region) => !hasRegionLayout(region))) return;
+    const top = Math.min(...regions.map((region) => region.layoutY));
+    image.homePageHeight = Math.max(...regions.map((region) => region.layoutY + region.layoutH)) - top;
+    regions.forEach((region) => { region.homeLayoutX = region.layoutX; region.homeLayoutY = region.layoutY - top; });
+  });
 }
 
 async function autoRenumberWithAgent() {
@@ -1134,7 +1279,7 @@ async function autoRenumberWithAgent() {
     const assignments = Array.isArray(result.assignments) ? result.assignments : [];
     const byId = new Map(assignments.map((assignment) => [assignment.id, assignment.group]));
     pushHistory();
-    state.images.forEach((image) => image.regions.forEach((region) => {
+    state.images.forEach((image) => (image.regions.length ? image.regions : [image.syntheticRegion]).filter(Boolean).forEach((region) => {
       const group = byId.get(region.id);
       if (group) region.group = group;
     }));
@@ -1187,14 +1332,14 @@ async function exportFinal() {
   try { const html = await buildExportHtml(); const output = window.open("", "_blank"); if (!output) throw new Error("浏览器拦截了预览窗口，请允许弹窗"); output.document.write(html); output.document.close(); setProcessingStatus("终稿预览已打开"); } catch (error) { setProcessingStatus("导出失败"); showToast(error.message || "导出失败", "error"); } finally { button.disabled = false; }
 }
 
-async function buildExportHtml() {
+async function collectExportEntries(showProgress = true) {
   const entries = [];
   const totalImages = state.images.length;
   let imageIndex = 0;
   let fallbackY = 28;
   for (const image of state.images) {
     imageIndex += 1;
-    setProcessingStatus("正在裁剪第 " + imageIndex + "/" + totalImages + " 张素材…");
+    if (showProgress) setProcessingStatus("正在裁剪第 " + imageIndex + "/" + totalImages + " 张素材…");
     if (!image.sourceWidth || !image.sourceHeight) {
       const size = await imageSize(image.src);
       image.sourceWidth = size.width;
@@ -1216,11 +1361,20 @@ async function buildExportHtml() {
       if (!Number.isFinite(region.layoutY)) region.layoutY = fallbackY;
       fallbackY = Math.max(fallbackY, region.layoutY + region.layoutH + 24);
       const group = state.keepGroups ? (region.group || region.id) : region.id;
-      entries.push({ group, image, region, src: region.cropSrc || await cropRegion(image, region), order: entries.length });
+      if (!region.cropSrc) region.cropSrc = await cropRegion(image, region);
+      entries.push({ group, image, region, src: region.cropSrc, order: entries.length });
     }
   }
-  setProcessingStatus("正在按终端画布顺序整理集合分页…");
+  if (showProgress) setProcessingStatus("正在按终端画布顺序整理集合分页…");
   entries.sort((a, b) => (a.region.layoutY || 0) - (b.region.layoutY || 0) || (a.region.layoutX || 0) - (b.region.layoutX || 0) || a.order - b.order);
+  return entries;
+}
+
+function exportSettings() {
+  return { size: $("#pageSize").value, margin: Number($("#pageMargin").value) || 0 };
+}
+
+function createExportPlan(entries, settings = exportSettings()) {
   // Collections are indivisible flow units. They keep their internal terminal-
   // canvas arrangement, but several collections may share one page. A page break
   // is inserted only before the next collection would cross the page bottom.
@@ -1229,10 +1383,10 @@ async function buildExportHtml() {
     if (!collections.has(entry.group)) collections.set(entry.group, []);
     collections.get(entry.group).push(entry);
   });
-  const size = $("#pageSize").value;
+  const size = settings.size;
   const dimensions = { a4: [794, 1123], a3: [1123, 1587], letter: [816, 1056] };
   const [pageWidth, pageHeight] = dimensions[size] || dimensions.a4;
-  const pageMargin = clamp(Number($("#pageMargin").value), 0, Math.floor(Math.min(pageWidth, pageHeight) / 2));
+  const pageMargin = clamp(Number(settings.margin) || 0, 0, Math.floor(Math.min(pageWidth, pageHeight) / 2));
   const usableWidth = Math.max(1, pageWidth - pageMargin * 2);
   const usableHeight = Math.max(1, pageHeight - pageMargin * 2);
   const canvasLeft = Math.min(...entries.map((entry) => Number.isFinite(entry.region.layoutX) ? entry.region.layoutX : 28));
@@ -1273,22 +1427,110 @@ async function buildExportHtml() {
     cursor = unit.pageTop + unit.height;
   }
   if (page.length) pages.push(page);
-
-  const pagesHtml = pages.map((pageItems) => {
-    const groupsHtml = pageItems.map((unit) => {
-      const { items, groupTop, scale, height } = unit;
-      const blocksHtml = items.map((item) => {
+  const pagePlans = pages.map((units, pageIndex) => ({
+    pageIndex,
+    blocks: units.flatMap(({ items, groupTop, scale, pageTop }) => items.map((item) => {
         const region = item.region;
         const left = Math.max(0, Math.round(pageMargin + ((Number.isFinite(region.layoutX) ? region.layoutX : canvasLeft) - canvasLeft) * scale));
-        const top = Math.max(0, Math.round(((Number.isFinite(region.layoutY) ? region.layoutY : groupTop) - groupTop) * scale));
+        const top = Math.round(pageTop) + Math.max(0, Math.round(((Number.isFinite(region.layoutY) ? region.layoutY : groupTop) - groupTop) * scale));
         const width = Math.max(1, Math.round((Number.isFinite(region.layoutW) ? region.layoutW : 1) * scale));
         const blockHeight = Math.max(1, Math.round((Number.isFinite(region.layoutH) ? region.layoutH : 1) * scale));
-        return '<article class="print-block" style="left:' + left + 'px;top:' + top + 'px;width:' + width + 'px;height:' + blockHeight + 'px"><img src="' + escapeHtml(item.src) + '" alt="' + escapeHtml(region.label || '') + '" style="width:' + width + 'px;height:' + blockHeight + 'px" /></article>';
-      }).join('');
-      return '<div class="print-group" data-group="' + escapeHtml(items[0].group) + '" style="left:0;top:' + Math.round(unit.pageTop) + 'px;height:' + Math.ceil(height) + 'px">' + blocksHtml + '</div>';
-    }).join('');
-    return '<section class="print-page"><div class="print-page-content">' + groupsHtml + '</div></section>';
-  }).join('');
+        return { ...item, left, top, width, height: blockHeight, scale };
+    })),
+  }));
+  return { size, pageWidth, pageHeight, pageMargin, canvasLeft: entries.length ? canvasLeft : 0, terminalScale, pages: pagePlans };
+}
+
+function loadCanvasImage(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    if (!src.startsWith("data:") && !src.startsWith("blob:")) image.crossOrigin = "anonymous";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("无法读取排版参考图中的素材，请重新导入该图片"));
+    image.src = src;
+  });
+}
+
+async function rasterizeExportPage(page, plan) {
+  const canvas = document.createElement("canvas");
+  canvas.width = plan.pageWidth; canvas.height = plan.pageHeight;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  for (const block of page.blocks) {
+    const image = await loadCanvasImage(block.src);
+    const ratio = Math.min(block.width / image.naturalWidth, block.height / image.naturalHeight);
+    // Same object-fit:contain / left-top geometry and opaque image background
+    // as the exported HTML. No labels, boundaries, or editor UI are painted.
+    ctx.fillRect(block.left, block.top, block.width, block.height);
+    ctx.drawImage(image, block.left, block.top, image.naturalWidth * ratio, image.naturalHeight * ratio);
+  }
+  return canvas.toDataURL("image/png");
+}
+
+async function buildCropSheets(entries) {
+  const width = 800, maxHeight = 1600, padding = 12, header = 26;
+  const sheets = [];
+  let canvas = null, ctx = null, blocks = [], y = padding;
+  const start = () => {
+    canvas = document.createElement("canvas"); canvas.width = width; canvas.height = maxHeight;
+    ctx = canvas.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, width, maxHeight);
+    blocks = []; y = padding;
+  };
+  const finish = () => {
+    if (!blocks.length) return;
+    const trimmed = document.createElement("canvas"); trimmed.width = width; trimmed.height = Math.ceil(y);
+    trimmed.getContext("2d").drawImage(canvas, 0, 0);
+    sheets.push({ kind: "crop-sheet", width, height: trimmed.height, blocks, image: trimmed.toDataURL("image/png") });
+  };
+  start();
+  for (const entry of entries) {
+    const image = await loadCanvasImage(entry.src);
+    const scale = Math.min(1, (width - padding * 2) / image.naturalWidth, (maxHeight - padding * 2 - header) / image.naturalHeight);
+    const w = Math.max(1, image.naturalWidth * scale), h = Math.max(1, image.naturalHeight * scale);
+    if (blocks.length && y + header + h + padding > maxHeight) { finish(); start(); }
+    ctx.fillStyle = "#f0edf8"; ctx.fillRect(padding, y, width - padding * 2, header - 4);
+    ctx.fillStyle = "#342950"; ctx.font = "13px sans-serif";
+    ctx.fillText(`${entry.region.id} / ${entry.region.group || "—"} · ${entry.region.label || entry.image.name}`, padding + 5, y + 15, width - padding * 2 - 10);
+    ctx.drawImage(image, padding, y + header, w, h);
+    blocks.push({ id: entry.region.id, imageId: entry.image.id, group: entry.region.group, x: padding, y: y + header, w, h });
+    y += header + h + padding;
+  }
+  finish();
+  return sheets;
+}
+
+async function buildLayoutViews(image, fixed) {
+  const entries = await collectExportEntries(false);
+  const plan = createExportPlan(entries);
+  const pageIndices = new Set(plan.pages.filter((page) => page.blocks.some((block) => block.image.id === image.id)).map((page) => page.pageIndex));
+  // Include the current material's actual PDF pages and the previous completed
+  // material's last page. Older unrelated pages add tokens but no placement help.
+  const lastFixedImage = fixed[fixed.length - 1]?.image.id;
+  const previousPages = plan.pages.filter((page) => page.blocks.some((block) => block.image.id === lastFixedImage));
+  if (previousPages.length) pageIndices.add(previousPages[previousPages.length - 1].pageIndex);
+  const views = [];
+  for (const pageIndex of [...pageIndices].sort((a, b) => a - b)) {
+    const page = plan.pages[pageIndex];
+    views.push({
+      kind: "pdf-page", pageIndex, width: plan.pageWidth, height: plan.pageHeight,
+      blocks: page.blocks.map((block) => ({
+        id: block.region.id, imageId: block.image.id, group: block.group,
+        x: block.left, y: block.top, w: block.width, h: block.height, scale: block.scale,
+        canvasX: block.region.layoutX, canvasY: block.region.layoutY, canvasW: block.region.layoutW, canvasH: block.region.layoutH,
+      })),
+      image: await rasterizeExportPage(page, plan),
+    });
+  }
+  views.push(...await buildCropSheets(entries.filter((entry) => entry.image.id === image.id)));
+  return views;
+}
+
+async function buildExportHtml() {
+  const plan = createExportPlan(await collectExportEntries());
+  const { size, pageWidth, pageHeight, pages } = plan;
+  const pagesHtml = pages.map(({ blocks }) => '<section class="print-page"><div class="print-page-content">' + blocks.map(({ region, src, group, left, top, width, height }) =>
+    '<article class="print-block" data-group="' + escapeHtml(group) + '" data-region-id="' + escapeHtml(region.id) + '" style="left:' + left + 'px;top:' + top + 'px;width:' + width + 'px;height:' + height + 'px"><img src="' + escapeHtml(src) + '" alt="' + escapeHtml(region.label || '') + '" style="width:' + width + 'px;height:' + height + 'px" /></article>'
+  ).join('') + '</div></section>').join('');
   setProcessingStatus("正在打开纯内容 PDF 预览（" + pages.length + " 页）…");
   const css = '@page{size:' + size + ' portrait;margin:0}' +
     '*{box-sizing:border-box}' +

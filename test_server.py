@@ -58,6 +58,11 @@ class StructuredOutputTests(unittest.TestCase):
                 {"id": "r2", "imageId": "img1", "imageName": "draft.png", "label": "Figure", "kind": "image", "group": "Q1", "layoutX": 28, "layoutY": 152, "layoutW": 240, "layoutH": 180},
             ],
             "images": [],
+            "layoutContext": {"step": 2, "total": 3, "fixedBlocks": [{"id": "previous", "x": 24, "y": 24, "w": 200, "h": 100}], "pendingImageIds": ["img3"]},
+            "layoutViews": [
+                {"kind": "pdf-page", "pageIndex": 0, "width": 794, "height": 1123, "blocks": [], "image": "data:image/png;base64,cGRm"},
+                {"kind": "crop-sheet", "width": 800, "height": 320, "blocks": [], "image": "data:image/png;base64,Y3JvcA=="},
+            ],
         }
         captured: dict = {}
 
@@ -89,11 +94,38 @@ class StructuredOutputTests(unittest.TestCase):
             self.assertEqual(len(result["placements"]), 2)
             self.assertEqual(captured["model"], server.QWEN_MODEL)
             self.assertIn("already semantically segmented", captured["prompt"])
-            self.assertEqual(captured["images"], [])
+            self.assertEqual(captured["images"], [view["image"] for view in payload["layoutViews"]])
+            self.assertIn("ONE STEP", captured["prompt"])
+            self.assertIn("EXACT SAME page layout", captured["prompt"])
+            self.assertIn('"pendingImageIds": ["img3"]', captured["prompt"])
         finally:
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=2)
+
+    def test_layout_rejects_whole_project_or_missing_pdf_views(self) -> None:
+        with self.assertRaisesRegex(ValueError, "一张素材"):
+            server.run_agent_operation({"regions": [{"id": "r1", "imageId": "img1"}, {"id": "r2", "imageId": "img2"}]}, "layout")
+        with self.assertRaisesRegex(ValueError, "PDF"):
+            server._agent_layout_views({"layoutViews": [{"kind": "crop-sheet", "image": "data:image/png;base64,eA=="}]})
+
+    @unittest.skipIf(server.Image is None, "Pillow is required")
+    def test_shared_boundary_labels_are_always_outside_source(self) -> None:
+        source = server.Image.new("RGB", (400, 300), "white")
+        regions = [
+            {"id": "edge", "group": "Q1", "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]]},
+            {"id": "triangle", "group": "Q2", "polygon": [[30, 30], [65, 40], [45, 65]]},
+        ]
+        canvas = server._boundary_annotation_canvas(source, regions, (0, 0, 400, 300))
+        self.assertGreater(canvas.width, source.width)
+        with patch.object(server.ImageDraw.ImageDraw, "text", autospec=True) as text:
+            server._draw_candidate_boundaries(canvas, regions, (0, 0, 400, 300))
+        self.assertEqual(text.call_count, 2)
+        for call in text.call_args_list:
+            _, (x, y), label = call.args
+            self.assertGreater(x, source.width)
+            self.assertGreaterEqual(y, 0)
+            self.assertIn(" / Q", label)
 
     def test_reanalysis_endpoint_sends_boundary_overlay_and_accepts_corrected_polygon(self) -> None:
         current = [[40, 40], [60, 40], [60, 60], [40, 60]]
@@ -225,7 +257,8 @@ class StructuredOutputTests(unittest.TestCase):
         images = server.make_supervision_images(image_data_url, regions)
         self.assertEqual(len(images), 2)
         rendered = [server.Image.open(BytesIO(base64.b64decode(item.split(",", 1)[1]))).convert("RGB") for item in images]
-        self.assertEqual(rendered[0].size, source.size)
+        self.assertGreater(rendered[0].width, source.width)
+        self.assertEqual(rendered[0].height, source.height)
         self.assertGreater(rendered[1].width, rendered[0].width)
         self.assertGreater(rendered[1].height, rendered[0].height)
         self.assertNotEqual(rendered[0].getpixel((40, 30)), (255, 255, 255))

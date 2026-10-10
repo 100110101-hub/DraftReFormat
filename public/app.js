@@ -1,6 +1,7 @@
 /* Draft ReFormat — browser-side editor. */
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+const CANVAS_WIDTH = 800;
 
 const kindNames = {
   text: "文字段落", image: "图片 / 插图", table: "表格", chemistry: "化学结构式",
@@ -38,6 +39,7 @@ const state = {
   keepGroups: true,
   draggingImageId: null,
   suppressTileClick: false,
+  canvasLocked: false,
 };
 
 function demoImage() {
@@ -71,7 +73,7 @@ function init() {
 }
 
 function currentImage() { return state.images.find((image) => image.id === state.currentId) || null; }
-function selectedRegion() { const image = currentImage(); return image?.regions.find((region) => region.id === state.selectedRegionId) || null; }
+function selectedRegion() { const image = currentImage(); return image?.regions.find((region) => region.id === state.selectedRegionId) || (image?.syntheticRegion?.id === state.selectedRegionId ? image.syntheticRegion : null); }
 function regionKey(imageId, regionId) { return `${imageId}::${regionId}`; }
 function selectedRegionEntries() {
   const entries = [];
@@ -79,7 +81,7 @@ function selectedRegionEntries() {
     const split = key.indexOf("::");
     const imageId = key.slice(0, split), regionId = key.slice(split + 2);
     const image = state.images.find((item) => item.id === imageId);
-    const region = image?.regions.find((item) => item.id === regionId);
+    const region = image?.regions.find((item) => item.id === regionId) || (image?.syntheticRegion?.id === regionId ? image.syntheticRegion : null);
     if (image && region) entries.push({ image, region });
   }
   if (!entries.length) { const image = currentImage(), region = selectedRegion(); if (image && region) entries.push({ image, region }); }
@@ -112,13 +114,15 @@ function pushHistorySnapshot(before) {
   if (image?.supervisionPending && !image.applyingSupervision) image.supervisionUserEdited = true;
   state.history.push(before); if (state.history.length > 35) state.history.shift(); state.redo = [];
 }
-function undo() { if (!state.history.length) return showToast("没有可撤销的操作", "warn"); state.redo.push(snapshot()); restoreSnapshot(state.history.pop()); }
-function redo() { if (!state.redo.length) return showToast("没有可重做的操作", "warn"); state.history.push(snapshot()); restoreSnapshot(state.redo.pop()); }
+function undo() { if (!canEditCanvas()) return; if (!state.history.length) return showToast("没有可撤销的操作", "warn"); state.redo.push(snapshot()); restoreSnapshot(state.history.pop()); }
+function redo() { if (!canEditCanvas()) return; if (!state.redo.length) return showToast("没有可重做的操作", "warn"); state.history.push(snapshot()); restoreSnapshot(state.redo.pop()); }
 
 function render() {
+  updateCanvasLock();
   $("#projectName").textContent = state.projectName;
   $("#imageCount").textContent = state.images.length;
   renderAssets();
+  updateCanvasLock();
   const image = currentImage();
   $("#emptyState").hidden = !!image;
   $("#canvasWrap").hidden = !image;
@@ -160,7 +164,7 @@ function renderRegions() {
     box.addEventListener("click", (event) => {
       event.stopPropagation();
       if (state.suppressTileClick) { state.suppressTileClick = false; return; }
-      const image = state.images.find((item) => item.id === box.dataset.imageId), region = image?.regions.find((item) => item.id === box.dataset.regionId);
+      const image = state.images.find((item) => item.id === box.dataset.imageId), region = image?.regions.find((item) => item.id === box.dataset.regionId) || (image?.syntheticRegion?.id === box.dataset.regionId ? image.syntheticRegion : null);
       if (!image || !region) return;
       const entry = { image, region };
       if (event.shiftKey) {
@@ -230,7 +234,7 @@ function updateBoundaryVisibility() {
 function visualRegions() {
   const result = [];
   state.images.forEach((image) => {
-    if (!image.regions.length && !image.syntheticRegion) image.syntheticRegion = { id: `whole-${image.id}`, label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, confidence: 1, group: "—", description: "尚未分析的整张图片", synthetic: true, layoutW: 740, layoutH: 300, layoutX: 28, layoutY: 28 };
+    if (!image.regions.length && !image.syntheticRegion) image.syntheticRegion = { id: `whole-${image.id}`, label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, confidence: 1, group: "—", description: "尚未分析的整张图片", synthetic: true, layoutW: Math.min(CANVAS_WIDTH, image.sourceWidth || CANVAS_WIDTH), layoutH: 300, layoutX: 0, layoutY: 0 };
     const regions = image.regions.length ? image.regions : [image.syntheticRegion];
     regions.forEach((region) => result.push({ image, region }));
   });
@@ -240,8 +244,8 @@ function visualRegions() {
 function updateOutputCanvasSize(items) {
   const canvas = $("#outputCanvas"); if (!canvas) return;
   const bottom = items.reduce((max, item) => Math.max(max, item.region.layoutY + item.region.layoutH), 0);
-  canvas.style.height = `${Math.max(1120, bottom + 44)}px`;
-  canvas.style.minHeight = `${Math.max(1120, bottom + 44)}px`;
+  canvas.style.height = `${Math.max(1120, bottom)}px`;
+  canvas.style.minHeight = `${Math.max(1120, bottom)}px`;
 }
 
 async function hydrateVisualRegions() {
@@ -254,12 +258,12 @@ async function hydrateVisualRegions() {
 
     // Establish every block's real size and vertical position before any crop
     // decoding starts. Otherwise newly analyzed blocks briefly render as 1px
-    // tiles at (28,28), which looks like the whole result collapsed to the corner.
+    // tiles in one corner, which looks like the whole result collapsed.
     normalizeLongLayout();
     renderRegions();
 
     for (const { image, region } of items) {
-      if (region.synthetic) { region.layoutW = 740; region.layoutH = Math.round(740 / (image.aspect || .72)); }
+      if (region.synthetic) { region.layoutW = Math.min(CANVAS_WIDTH, image.sourceWidth || CANVAS_WIDTH); region.layoutH = Math.round(region.layoutW / (image.aspect || .72)); }
       if (!region.cropSrc && !region.synthetic) region.cropSrc = await cropRegion(image, region);
       if (region.synthetic && !region.cropSrc) { region.cropSrc = image.src; image.previewReady = true; }
     }
@@ -278,37 +282,36 @@ async function ensureImageMetrics(image) {
   image.sourceHeight = size.height;
   image.aspect = size.width && size.height ? size.width / size.height : .72;
   // Fit large source images to the canvas, but never upscale a small one.
-  image.displayScale = Math.min(1, 760 / Math.max(1, image.sourceWidth));
+  image.displayScale = Math.min(1, CANVAS_WIDTH / Math.max(1, image.sourceWidth));
 }
 
-function imageSize(src) { return new Promise((resolve) => { const img = new Image(); img.onload = () => resolve({ width: img.naturalWidth || 760, height: img.naturalHeight || Math.round(760 / .72) }); img.onerror = () => resolve({ width: 760, height: Math.round(760 / .72) }); img.src = src; }); }
+function imageSize(src) { return new Promise((resolve) => { const img = new Image(); img.onload = () => resolve({ width: img.naturalWidth || CANVAS_WIDTH, height: img.naturalHeight || Math.round(CANVAS_WIDTH / .72) }); img.onerror = () => resolve({ width: CANVAS_WIDTH, height: Math.round(CANVAS_WIDTH / .72) }); img.src = src; }); }
 
 function initializeRegionLayout(region, image) {
-  const baseWidth = Math.min(760, image.sourceWidth || 760);
+  const baseWidth = Math.min(CANVAS_WIDTH, image.sourceWidth || CANVAS_WIDTH);
   const scale = image.displayScale || (baseWidth / Math.max(1, image.sourceWidth || baseWidth));
   // Keep the crop's native proportions and never enlarge a source image.
   const sourceW = Math.max(0.1, Number(region.w) || 100);
   const sourceH = Math.max(0.1, Number(region.h) || 100);
   region.layoutW = Math.max(1, Math.round((image.sourceWidth || baseWidth) * sourceW / 100 * scale));
   region.layoutH = Math.max(1, Math.round((image.sourceHeight || baseWidth / (image.aspect || .72)) * sourceH / 100 * scale));
-  region.layoutX = 28;
+  region.layoutX = 0;
   const all = visualRegions().filter(({ region: item }) => item !== region && item.layoutY != null);
-  const last = all.reduce((max, item) => Math.max(max, item.region.layoutY + item.region.layoutH), 30);
-  region.layoutY = last + 24;
+  const last = all.reduce((max, item) => Math.max(max, item.region.layoutY + item.region.layoutH), 0);
+  region.layoutY = last;
 }
 
 function normalizeLongLayout() {
-  let y = 28;
+  let y = 0;
   state.images.forEach((image) => {
     const regions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
     regions.forEach((region) => {
       if (!hasRegionLayout(region)) initializeRegionLayout(region, image);
-      if (!region.userMoved) { region.layoutX = 28; region.layoutY = y; }
-      if (!Number.isFinite(region.layoutX)) region.layoutX = 28;
+      if (!region.userMoved) { region.layoutX = 0; region.layoutY = y; }
+      if (!Number.isFinite(region.layoutX)) region.layoutX = 0;
       if (!Number.isFinite(region.layoutY)) region.layoutY = y;
-      y = Math.max(y, region.layoutY + region.layoutH + 24);
+      y = Math.max(y, region.layoutY + region.layoutH);
     });
-    y += 20;
   });
   captureHomePageLayout();
 }
@@ -317,11 +320,11 @@ function captureHomePageLayout() {
   state.images.forEach((image) => {
     const regions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
     if (!regions.length || regions.some((region) => !hasRegionLayout(region))) return;
-    const top = Math.min(...regions.map((region) => Number.isFinite(region.layoutY) ? region.layoutY : 28));
+    const top = Math.min(...regions.map((region) => Number.isFinite(region.layoutY) ? region.layoutY : 0));
     const bottom = Math.max(...regions.map((region) => (Number.isFinite(region.layoutY) ? region.layoutY : top) + (Number.isFinite(region.layoutH) ? region.layoutH : 1)));
     if (!Number.isFinite(image.homePageHeight)) image.homePageHeight = bottom - top;
     regions.forEach((region) => {
-      if (!Number.isFinite(region.homeLayoutX)) region.homeLayoutX = Number.isFinite(region.layoutX) ? region.layoutX : 28;
+      if (!Number.isFinite(region.homeLayoutX)) region.homeLayoutX = Number.isFinite(region.layoutX) ? region.layoutX : 0;
       if (!Number.isFinite(region.homeLayoutY)) region.homeLayoutY = (Number.isFinite(region.layoutY) ? region.layoutY : top) - top;
     });
   });
@@ -329,24 +332,25 @@ function captureHomePageLayout() {
 
 function restoreHomePagePositions() {
   captureHomePageLayout();
-  let pageTop = 28;
+  let pageTop = 0;
   state.images.forEach((image) => {
     const regions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
     image.layoutPageY = pageTop;
     let pageBottom = 0;
     regions.forEach((region) => {
-      region.layoutX = Number.isFinite(region.homeLayoutX) ? region.homeLayoutX : 28;
+      region.layoutX = Number.isFinite(region.homeLayoutX) ? region.homeLayoutX : 0;
       region.layoutY = pageTop + (Number.isFinite(region.homeLayoutY) ? region.homeLayoutY : 0);
       region.userMoved = false;
       pageBottom = Math.max(pageBottom, (region.homeLayoutY || 0) + (region.layoutH || 1));
     });
     const pageHeight = Math.max(Number(image.homePageHeight) || 0, pageBottom);
     image.homePageHeight = pageHeight;
-    pageTop += pageHeight + 40;
+    pageTop += pageHeight;
   });
 }
 
 function reorderAssets(sourceId, targetId, sortedImages = null) {
+  if (!canEditCanvas()) return;
   if (sortedImages) {
     if (state.images.every((image, index) => image.id === sortedImages[index]?.id)) return;
     pushHistory(); captureHomePageLayout(); state.images = sortedImages; restoreHomePagePositions();
@@ -398,7 +402,9 @@ function renderInspector() {
   $("#regionGroup").value = region.group || "";
   $("#groupBadge").textContent = region.group || "—";
   renderPolygonEditor(region);
+  renderHoleRecovery(region);
   $$("#regionInspector .single-region-control :is(input,button,select)").forEach((control) => { control.disabled = multi; });
+  updateCanvasLock();
   const confidence = Math.round((region.confidence ?? .6) * 100); $("#confidenceValue").textContent = `${confidence}%`; $("#confidenceBar").style.width = `${confidence}%`; $("#regionDescription").textContent = region.description || "语义内容区域";
 }
 
@@ -419,6 +425,33 @@ function renderPolygonEditor(region) {
   $("#polygonPreview").innerHTML = `<polygon class="preview-polygon-fill" points="${polygon.map(([x, y]) => `${(x - minX).toFixed(3)},${(y - minY).toFixed(3)}`).join(" ")}"/>${renderRegionBoundarySvg(region, width, height, "preview-model-boundary", previewRect.width, previewRect.height)}`;
   $("#polygonVertices").innerHTML = polygon.map(([x, y], index) => `<div class="polygon-vertex-row" data-vertex-index="${index}"><strong>V${index + 1}</strong><label>X<input type="number" min="0" max="100" step="0.1" value="${Number(x).toFixed(2)}" data-vertex-axis="0" aria-label="顶点 ${index + 1} X" /></label><label>Y<input type="number" min="0" max="100" step="0.1" value="${Number(y).toFixed(2)}" data-vertex-axis="1" aria-label="顶点 ${index + 1} Y" /></label><button type="button" data-remove-vertex="${index}" title="移除此顶点" ${polygon.length <= 3 ? "disabled" : ""}>×</button></div>`).join("");
   updateBoundaryVisibility();
+}
+
+function renderHoleRecovery(region) {
+  const holes = region?.holes || [];
+  $("#holeRecovery").hidden = !holes.length;
+  $("#holeRecoveryList").innerHTML = holes.map((hole, index) => `<div class="hole-recovery-row"><span>挖空区域 ${index + 1}</span><button type="button" data-restore-hole="${index}">恢复此块</button></div>`).join("");
+}
+
+function restoreRegionHoles(index = null) {
+  if (!canEditCanvas()) return;
+  const entries = selectedRegionEntries();
+  if (entries.length !== 1) return showToast("请单选要恢复挖空内容的原块", "warn");
+  const { image, region } = entries[0], holes = region.holes || [];
+  if (!holes.length || (index !== null && (!Number.isInteger(index) || index < 0 || index >= holes.length))) return;
+  const restored = holes.filter((hole, i) => index === null || i === index);
+  pushHistory();
+  const children = new Set(restored.map((hole) => hole.extractedRegionId).filter(Boolean));
+  // Older projects do not record the link. Only merge an exact, unmodified
+  // manual cut; never infer ownership of an independent AI region.
+  restored.filter((hole) => !hole.extractedRegionId).forEach((hole) => {
+    image.regions.filter((child) => child.id.startsWith("manual-") && child.description === "从原内容块手工抠出的多边形区域" && JSON.stringify(child.polygon) === JSON.stringify(hole.polygon)).forEach((child) => children.add(child.id));
+  });
+  image.regions = image.regions.filter((child) => child.id === region.id || !children.has(child.id));
+  region.holes = holes.filter((hole, i) => index !== null && i !== index);
+  region.cropSrc = null; image.previewReady = false;
+  setSelection([{ image, region }]); render();
+  showToast(`已恢复 ${restored.length} 处挖空内容，可撤销`, "success");
 }
 
 function polygonArea(polygon) {
@@ -453,8 +486,8 @@ function setRegionPolygon(image, region, polygon) {
   const oldW = Math.max(.001, Number(region.w) || 1), oldH = Math.max(.001, Number(region.h) || 1);
   const xs = polygon.map(([x]) => x), ys = polygon.map(([, y]) => y);
   const x = Math.min(...xs), y = Math.min(...ys), w = Math.max(...xs) - x, h = Math.max(...ys) - y;
-  const sourceWidth = Number(image.sourceWidth) || 760, sourceHeight = Number(image.sourceHeight) || 1000;
-  const scale = Number(image.displayScale) || Math.min(1, 760 / Math.max(1, sourceWidth));
+  const sourceWidth = Number(image.sourceWidth) || CANVAS_WIDTH, sourceHeight = Number(image.sourceHeight) || 1000;
+  const scale = Number(image.displayScale) || Math.min(1, CANVAS_WIDTH / Math.max(1, sourceWidth));
   const dx = (x - oldX) / 100 * sourceWidth * scale, dy = (y - oldY) / 100 * sourceHeight * scale;
   if (hasRegionLayout(region)) {
     region.layoutX += dx; region.layoutY += dy;
@@ -478,6 +511,7 @@ function setRegionPolygon(image, region, polygon) {
 }
 
 function editPolygonVertex(index, axis, value) {
+  if (!canEditCanvas()) return;
   const { image, region } = selectedRegionEntries()[0] || {};
   if (!image || !region || !Number.isFinite(value)) return;
   const polygon = regionPolygon(region).map((point) => [...point]);
@@ -489,10 +523,11 @@ function editPolygonVertex(index, axis, value) {
 }
 
 function addPolygonVertex() {
+  if (!canEditCanvas()) return;
   const { image, region } = selectedRegionEntries()[0] || {};
   if (!image || !region) return;
   const polygon = regionPolygon(region).map((point) => [...point]);
-  const sourceWidth = Number(image.sourceWidth) || 760, sourceHeight = Number(image.sourceHeight) || 1000;
+  const sourceWidth = Number(image.sourceWidth) || CANVAS_WIDTH, sourceHeight = Number(image.sourceHeight) || 1000;
   let edgeIndex = 0, longest = -1;
   polygon.forEach((point, index) => {
     const next = polygon[(index + 1) % polygon.length];
@@ -506,6 +541,7 @@ function addPolygonVertex() {
 }
 
 function removePolygonVertex(index) {
+  if (!canEditCanvas()) return;
   const { image, region } = selectedRegionEntries()[0] || {};
   if (!image || !region) return;
   const polygon = regionPolygon(region).map((point) => [...point]);
@@ -522,6 +558,9 @@ function bindEvents() {
   $("#segmentAllButton").addEventListener("click", segmentAll);
   $("#agentLayoutButton").addEventListener("click", autoLayoutWithAgent);
   $("#agentRenumberButton").addEventListener("click", autoRenumberWithAgent);
+  $("#canvasLockToggle").addEventListener("click", toggleCanvasLock);
+  $("#restoreAllHoles").addEventListener("click", () => restoreRegionHoles());
+  $("#holeRecoveryList").addEventListener("click", (event) => { const button = event.target.closest("[data-restore-hole]"); if (button) restoreRegionHoles(Number(button.dataset.restoreHole)); });
   $("#importUrlButton").addEventListener("click", importWebpage);
   $("#urlInput").addEventListener("keydown", (event) => { if (event.key === "Enter") importWebpage(); });
   $("#undoButton").addEventListener("click", undo); $("#redoButton").addEventListener("click", redo);
@@ -539,17 +578,17 @@ function bindEvents() {
   $("#sortImages").addEventListener("click", () => reorderAssets(null, null, [...state.images].sort((a, b) => a.name.localeCompare(b.name, "zh", { numeric: true }))));
   $("#sortImagesByName").addEventListener("click", () => reorderAssets(null, null, [...state.images].sort((a, b) => a.name.localeCompare(b.name, "zh"))));
   $("#kindSelect").addEventListener("click", () => $("#kindMenu").classList.toggle("open"));
-  $$("#kindMenu button").forEach((button) => button.addEventListener("click", () => { const region = selectedRegion(); if (!region) return; pushHistory(); region.kind = button.dataset.kind; render(); }));
-  $$(".suggestion-row button").forEach((button) => button.addEventListener("click", () => { const region = selectedRegion(); if (!region) return; pushHistory(); region.label = button.dataset.label; render(); }));
+  $$("#kindMenu button").forEach((button) => button.addEventListener("click", () => { if (!canEditCanvas()) return; const region = selectedRegion(); if (!region) return; pushHistory(); region.kind = button.dataset.kind; render(); }));
+  $$(".suggestion-row button").forEach((button) => button.addEventListener("click", () => { if (!canEditCanvas()) return; const region = selectedRegion(); if (!region) return; pushHistory(); region.label = button.dataset.label; render(); }));
   $("#regionLabel").addEventListener("change", (event) => updateSelected("label", event.target.value));
   $("#regionGroup").addEventListener("change", (event) => updateSelected("group", event.target.value || "A"));
-  $("#newGroupButton").addEventListener("click", () => { const region = selectedRegion(); if (!region) return; pushHistory(); region.group = nextGroup(); render(); });
+  $("#newGroupButton").addEventListener("click", () => { if (!canEditCanvas()) return; const region = selectedRegion(); if (!region) return; pushHistory(); region.group = nextGroup(); render(); });
   $("#polygonVertices").addEventListener("change", (event) => { const input = event.target.closest("[data-vertex-axis]"); if (!input) return; editPolygonVertex(Number(input.closest("[data-vertex-index]").dataset.vertexIndex), Number(input.dataset.vertexAxis), input.value.trim() === "" ? NaN : Number(input.value)); });
   $("#polygonVertices").addEventListener("click", (event) => { const button = event.target.closest("[data-remove-vertex]"); if (button) removePolygonVertex(Number(button.dataset.removeVertex)); });
   $("#addPolygonVertex").addEventListener("click", addPolygonVertex);
   $("#layerBottom").addEventListener("click", () => changeLayer("bottom")); $("#layerDown").addEventListener("click", () => changeLayer("down")); $("#layerUp").addEventListener("click", () => changeLayer("up")); $("#layerTop").addEventListener("click", () => changeLayer("top"));
   $("#keepGroupsToggle").addEventListener("click", () => { state.keepGroups = !state.keepGroups; $("#keepGroupsToggle").classList.toggle("on", state.keepGroups); });
-  $("#pageMargin").addEventListener("change", (event) => { event.target.value = String(clamp(Number(event.target.value), 0, 120)); });
+  $("#pageMargin").addEventListener("change", (event) => { event.target.value = "0"; });
   $$(".tool-button").forEach((button) => button.addEventListener("click", () => setTool(button.dataset.tool)));
   const frame = $("#canvasFrame");
   frame.addEventListener("pointerdown", startCanvasPointer);
@@ -560,14 +599,44 @@ function bindEvents() {
 
 function setTool(tool) { state.tool = tool; setToolVisuals(); $$(".region-tile").forEach((tile) => { tile.dataset.tool = tool; }); }
 function setToolVisuals() { $$(".tool-button").forEach((button) => button.classList.toggle("active", button.dataset.tool === state.tool)); const name = { select: "选择", draw: "分区", brush: "涂白", cover: "覆盖" }[state.tool]; $("#toolHint").textContent = name; }
-function applyZoom() { $("#zoomLabel").textContent = `${Math.round(state.zoom * 100)}%`; const canvas = $("#outputCanvas"); if (canvas) canvas.style.zoom = state.zoom; $("#canvasWrap").style.width = "820px"; }
+function applyZoom() { $("#zoomLabel").textContent = `${Math.round(state.zoom * 100)}%`; const canvas = $("#outputCanvas"); if (canvas) canvas.style.zoom = state.zoom; $("#canvasWrap").style.width = `${CANVAS_WIDTH}px`; }
+
+function isCanvasLocked() { return state.canvasLocked || state.agentLayoutRunning; }
+function canEditCanvas() {
+  if (!isCanvasLocked()) return true;
+  showToast(state.agentLayoutRunning ? "自动排版中，手工编辑暂时锁定" : "画布已锁定，请先解锁再编辑", "warn");
+  return false;
+}
+function toggleCanvasLock() {
+  if (state.agentLayoutRunning) return showToast("自动排版完成后可切换画布锁定", "warn");
+  state.canvasLocked = !state.canvasLocked;
+  updateCanvasLock(); renderInspector();
+  showToast(state.canvasLocked ? "已锁定画布；仍可滚动、缩放和自动排版" : "画布已解锁", "success");
+}
+function updateCanvasLock() {
+  const locked = !!isCanvasLocked(), button = $("#canvasLockToggle");
+  $("#outputCanvas")?.classList.toggle("canvas-locked", locked);
+  $("#regionInspector")?.classList.toggle("editing-locked", locked);
+  if (button) {
+    button.innerHTML = `<span>${locked ? "🔒" : "🔓"}</span><em>${state.agentLayoutRunning ? "排版锁定" : locked ? "解锁画布" : "锁定画布"}</em>`;
+    button.setAttribute("aria-pressed", String(locked)); button.disabled = !!state.agentLayoutRunning;
+  }
+  const multi = (state.selectedRegionKeys || []).length > 1;
+  $$("#regionInspector :is(input,button,select)").forEach((control) => { control.disabled = locked || (multi && !!control.closest(".single-region-control")); });
+  $$("[data-delete-image], [data-move-image], #sortImages, #sortImagesByName, #deleteRegion, #clearWhiteouts, #undoButton, #redoButton, #segmentButton, #segmentAllButton").forEach((control) => {
+    control.disabled = locked || (control.dataset.moveImage && (state.images.findIndex((image) => image.id === control.dataset.moveImage) + Number(control.dataset.direction) < 0 || state.images.findIndex((image) => image.id === control.dataset.moveImage) + Number(control.dataset.direction) >= state.images.length));
+  });
+  $$("#regionInspector [data-remove-vertex]").forEach((control) => { control.disabled = locked || multi || (selectedRegion() && regionPolygon(selectedRegion()).length <= 3); });
+  $$(".tool-button[data-tool]").forEach((control) => { control.disabled = locked && control.dataset.tool !== "select"; });
+}
 
 function startRegionPointer(event, box) {
   event.stopPropagation(); event.preventDefault();
   const image = state.images.find((item) => item.id === box.dataset.imageId);
-  const region = image?.regions.find((item) => item.id === box.dataset.regionId);
+  const region = image?.regions.find((item) => item.id === box.dataset.regionId) || (image?.syntheticRegion?.id === box.dataset.regionId ? image.syntheticRegion : null);
   if (!image || !region) return;
   const entry = { image, region }, key = regionKey(image.id, region.id);
+  if (isCanvasLocked()) { setSelection([entry]); renderInspector(); return; }
   if (state.tool === "draw") return startPolygonCut(event, box, entry);
   if (state.tool === "cover") return startRegionCover(event, box, entry);
   if (state.tool === "brush") return startRegionBrush(event, box, entry);
@@ -589,12 +658,13 @@ function startRegionPointer(event, box) {
   const origins = selectedRegionEntries().map((item) => ({ ...item, x: item.region.layoutX, y: item.region.layoutY }));
   let moved = false;
   const move = (moveEvent) => {
+    if (isCanvasLocked()) return;
     const dx = (moveEvent.clientX - sx) / scale, dy = (moveEvent.clientY - sy) / scale;
     if (!moved && Math.abs(dx) + Math.abs(dy) < 2) return;
     moved = true;
     origins.forEach(({ region: item, x, y }) => {
-      item.layoutX = clamp(x + dx, 8, Math.max(8, 800 - (item.layoutW || 1)));
-      item.layoutY = Math.max(8, y + dy); item.userMoved = true;
+      item.layoutX = clamp(x + dx, 0, Math.max(0, CANVAS_WIDTH - (item.layoutW || 1)));
+      item.layoutY = Math.max(0, y + dy); item.userMoved = true;
     });
     renderRegions();
   };
@@ -620,7 +690,11 @@ function startCanvasPointer(event) {
     const entries = rect.w < 4 && rect.h < 4 ? [] : $$(".region-tile").filter((tile) => {
       const left = Number.parseFloat(tile.style.left), top = Number.parseFloat(tile.style.top), width = Number.parseFloat(tile.style.width), height = Number.parseFloat(tile.style.height);
       return left < rect.x + rect.w && left + width > rect.x && top < rect.y + rect.h && top + height > rect.y;
-    }).map((tile) => ({ image: state.images.find((item) => item.id === tile.dataset.imageId), region: state.images.find((item) => item.id === tile.dataset.imageId)?.regions.find((item) => item.id === tile.dataset.regionId) })).filter((item) => item.image && item.region);
+    }).map((tile) => {
+      const image = state.images.find((item) => item.id === tile.dataset.imageId);
+      const region = image?.regions.find((item) => item.id === tile.dataset.regionId) || (image?.syntheticRegion?.id === tile.dataset.regionId ? image.syntheticRegion : null);
+      return { image, region };
+    }).filter((item) => item.image && item.region);
     setSelection(entries); renderRegions(); renderInspector();
     window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
   };
@@ -640,6 +714,7 @@ function createTilePreview(box, kind) {
 }
 
 function startPolygonCut(event, box, { image, region }) {
+  if (!canEditCanvas()) return;
   const points = [tilePoint(event, box, true)], svg = createTilePreview(box, "polygon");
   const underlay = document.createElementNS(svg.namespaceURI, "polyline"), shape = document.createElementNS(svg.namespaceURI, "polyline");
   underlay.classList.add("draw-preview-underlay"); shape.classList.add("draw-preview-line");
@@ -655,6 +730,7 @@ function startPolygonCut(event, box, { image, region }) {
     const finalPoint = tilePoint(upEvent, box, true), last = points[points.length - 1];
     if (Math.hypot(finalPoint[0] - last[0], finalPoint[1] - last[1]) > .1) points.push(finalPoint);
     svg.remove(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+    if (!canEditCanvas()) return;
     const raw = points.filter((point, index) => !index || Math.hypot(point[0] - points[index - 1][0], point[1] - points[index - 1][1]) > .15);
     const tileClipped = clipPolygonToTile(raw);
     if (tileClipped.length < 3 || polygonSelfIntersects(tileClipped)) return showToast("分区轨迹无法形成有效多边形，请重新绘制", "warn");
@@ -665,7 +741,8 @@ function startPolygonCut(event, box, { image, region }) {
     if (polygons.some((polygon) => polygonArea(polygon) < .001 || polygonSelfIntersects(polygon))) return showToast("分区轨迹无法形成有效多边形，请重新绘制", "warn");
     pushHistory();
     const children = polygons.map((polygon) => makeManualPolygonRegion(image, region, polygon, "手动抠出"));
-    region.holes = [...(region.holes || []), ...polygons.map((polygon) => ({ polygon }))]; region.cropSrc = null;
+    if (region.synthetic) { delete region.synthetic; image.regions.push(region); delete image.syntheticRegion; }
+    region.holes = [...(region.holes || []), ...polygons.map((polygon, index) => ({ polygon, extractedRegionId: children[index].id }))]; region.cropSrc = null;
     image.regions.push(...children); setSelection(children.map((child) => ({ image, region: child }))); render();
     showToast(`多边形内容已从原块抠出为 ${children.length} 块；超出部分已沿模型边缘闭合`, "success");
   };
@@ -774,6 +851,7 @@ function intersectSimplePolygons(subject, clip) {
 }
 
 function startRegionCover(event, box, { region }) {
+  if (!canEditCanvas()) return;
   const start = tilePoint(event, box), svg = createTilePreview(box, "cover"), polygon = document.createElementNS(svg.namespaceURI, "polygon");
   svg.appendChild(polygon);
   const move = (moveEvent) => {
@@ -782,6 +860,7 @@ function startRegionCover(event, box, { region }) {
   };
   const up = (upEvent) => {
     const end = tilePoint(upEvent, box); svg.remove(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+    if (!canEditCanvas()) return;
     if (Math.abs(end[0] - start[0]) < 1 || Math.abs(end[1] - start[1]) < 1) return;
     pushHistory(); region.whiteoutPolygons = region.whiteoutPolygons || [];
     region.whiteoutPolygons.push([[start[0], start[1]], [end[0], start[1]], [end[0], end[1]], [start[0], end[1]]]);
@@ -791,6 +870,7 @@ function startRegionCover(event, box, { region }) {
 }
 
 function startRegionBrush(event, box, { region }) {
+  if (!canEditCanvas()) return;
   const points = [tilePoint(event, box)], rect = box.getBoundingClientRect(), svg = createTilePreview(box, "brush"), line = document.createElementNS(svg.namespaceURI, "polyline");
   line.setAttribute("stroke", "#fff"); line.setAttribute("stroke-width", String(Math.max(.6, 8 / rect.width * 100))); line.setAttribute("stroke-linecap", "round"); line.setAttribute("stroke-linejoin", "round");
   svg.appendChild(line); line.setAttribute("points", `${points[0][0]},${points[0][1]}`);
@@ -801,6 +881,7 @@ function startRegionBrush(event, box, { region }) {
   };
   const up = () => {
     svg.remove(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+    if (!canEditCanvas()) return;
     pushHistory(); region.whiteoutPaths = region.whiteoutPaths || [];
     region.whiteoutPaths.push({ points, width: Math.max(.6, 8 / rect.width * 100) }); region.cropSrc = null;
     render(); showToast("画笔涂白已应用到选中内容块", "success");
@@ -811,8 +892,8 @@ function startRegionBrush(event, box, { region }) {
 function makeManualPolygonRegion(image, parent, polygon, label) {
   const xs = polygon.map(([x]) => x), ys = polygon.map(([, y]) => y);
   const x = Math.min(...xs), y = Math.min(...ys), w = Math.max(...xs) - x, h = Math.max(...ys) - y;
-  const imageScale = image.displayScale || Math.min(1, 760 / Math.max(1, image.sourceWidth || 760));
-  const layoutW = Math.max(1, (image.sourceWidth || 760) * w / 100 * imageScale), layoutH = Math.max(1, (image.sourceHeight || 1000) * h / 100 * imageScale);
+  const imageScale = image.displayScale || Math.min(1, CANVAS_WIDTH / Math.max(1, image.sourceWidth || CANVAS_WIDTH));
+  const layoutW = Math.max(1, (image.sourceWidth || CANVAS_WIDTH) * w / 100 * imageScale), layoutH = Math.max(1, (image.sourceHeight || 1000) * h / 100 * imageScale);
   const relX = (x - parent.x) / parent.w, relY = (y - parent.y) / parent.h;
   return { id: `manual-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, label, kind: parent.kind, x, y, w, h, polygon, holes: structuredClone(parent.holes || []), group: parent.group, description: "从原内容块手工抠出的多边形区域", confidence: 1, cropSrc: null, layoutX: parent.layoutX + relX * parent.layoutW, layoutY: parent.layoutY + relY * parent.layoutH, layoutW, layoutH, homeLayoutX: (parent.homeLayoutX ?? parent.layoutX) + relX * parent.layoutW, homeLayoutY: (parent.homeLayoutY ?? 0) + relY * parent.layoutH, userMoved: true };
 }
@@ -822,15 +903,17 @@ function normPoint(clientX, clientY, rect) { return { x: clamp((clientX - rect.l
 function rectFromPoints(a, b) { return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) }; }
 function clamp(value, min, max) { return Math.max(min, Math.min(max, Number(value) || 0)); }
 function nextGroup() { const groups = new Set((currentImage()?.regions || []).map((region) => region.group)); let n = 1; while (groups.has(String.fromCharCode(64 + n))) n++; return String.fromCharCode(64 + n); }
-function updateSelected(key, value) { const region = selectedRegion(); if (!region) return; pushHistory(); if (["x", "y", "w", "h"].includes(key)) value = clamp(value, key === "w" || key === "h" ? 1 : 0, 100); region[key] = value; if (key === "x") region.w = Math.min(region.w, 100 - value); if (key === "y") region.h = Math.min(region.h, 100 - value); if (["x", "y", "w", "h"].includes(key)) region.cropSrc = null; render(); }
-function changeLayer(direction) { const image = currentImage(); const region = selectedRegion(); if (!image || !region) return showToast("请先选择一个内容块", "warn"); pushHistory(); const regions = image.regions; const index = regions.findIndex((item) => item.id === region.id); if (index < 0) return; const target = direction === "top" ? regions.length - 1 : direction === "bottom" ? 0 : direction === "up" ? Math.min(regions.length - 1, index + 1) : Math.max(0, index - 1); if (target !== index) { regions.splice(index, 1); regions.splice(target, 0, region); } regions.forEach((item, order) => { item.zIndex = order + 2; }); render(); showToast(direction === "top" ? "已置于顶层" : direction === "bottom" ? "已置于底层" : direction === "up" ? "已上移一层" : "已下移一层", "success"); }
+function updateSelected(key, value) { if (!canEditCanvas()) return; const region = selectedRegion(); if (!region) return; pushHistory(); if (["x", "y", "w", "h"].includes(key)) value = clamp(value, key === "w" || key === "h" ? 1 : 0, 100); region[key] = value; if (key === "x") region.w = Math.min(region.w, 100 - value); if (key === "y") region.h = Math.min(region.h, 100 - value); if (["x", "y", "w", "h"].includes(key)) region.cropSrc = null; render(); }
+function changeLayer(direction) { if (!canEditCanvas()) return; const image = currentImage(); const region = selectedRegion(); if (!image || !region) return showToast("请先选择一个内容块", "warn"); pushHistory(); const regions = image.regions; const index = regions.findIndex((item) => item.id === region.id); if (index < 0) return; const target = direction === "top" ? regions.length - 1 : direction === "bottom" ? 0 : direction === "up" ? Math.min(regions.length - 1, index + 1) : Math.max(0, index - 1); if (target !== index) { regions.splice(index, 1); regions.splice(target, 0, region); } regions.forEach((item, order) => { item.zIndex = order + 2; }); render(); showToast(direction === "top" ? "已置于顶层" : direction === "bottom" ? "已置于底层" : direction === "up" ? "已上移一层" : "已下移一层", "success"); }
 
 async function handleFiles(files) {
+  if (state.agentLayoutRunning) return showToast("请等待当前自动排版完成再导入素材", "warn");
   if (!files.length) return;
   for (const file of files) { const src = await fileToDataUrl(file); state.images.push(makeImage(file.name, src, { size: formatBytes(file.size) })); }
   if (!state.currentId) state.currentId = state.images[0].id; render(); showToast(`已加入 ${files.length} 张图片`, "success");
 }
 async function handleHtmlFiles(files) {
+  if (state.agentLayoutRunning) return showToast("请等待当前自动排版完成再导入素材", "warn");
   for (const file of files) {
     const html = await file.text();
     const title = (html.match(/<title[^>]*>(.*?)<\/title>/is)?.[1] || file.name).replace(/\s+/g, " ").trim();
@@ -879,6 +962,7 @@ async function waitForSupervision(jobId, initialResult) {
 }
 
 async function segmentCurrent() {
+  if (!canEditCanvas()) return;
   const image = currentImage(); if (!image) return showToast("请先选择一张图片", "warn");
   const button = $("#segmentButton"); button.disabled = true; button.innerHTML = '<span class="spinner"></span>正在理解语义…';
   setProcessingStatus("正在提交当前图片到 Qwen…");
@@ -895,6 +979,7 @@ async function segmentCurrent() {
 }
 
 async function segmentSelectedRegion() {
+  if (!canEditCanvas()) return;
   const image = currentImage();
   const parent = selectedRegion();
   if (!image || !parent || parent.synthetic) return showToast("请先选择一个可细分的内容块", "warn");
@@ -937,7 +1022,7 @@ async function segmentSelectedRegion() {
       image.sourceWidth = size.width;
       image.sourceHeight = size.height;
       image.aspect = size.width / Math.max(1, size.height);
-      image.displayScale = Math.min(1, 760 / Math.max(1, size.width));
+      image.displayScale = Math.min(1, CANVAS_WIDTH / Math.max(1, size.width));
     }
     if (!Number.isFinite(liveParent.layoutW) || !Number.isFinite(liveParent.layoutH)) initializeRegionLayout(liveParent, image);
 
@@ -993,6 +1078,7 @@ async function segmentSelectedRegion() {
 }
 
 async function reanalyzeSelectedRegion() {
+  if (!canEditCanvas()) return;
   const image = currentImage(), region = selectedRegion();
   if (!image || !region || region.synthetic) return showToast("请先选择一个可重分析的内容块", "warn");
   if (!image.src.startsWith("data:image/")) return showToast("原位重分析需要图片素材，请重新导入该图片", "warn");
@@ -1021,6 +1107,7 @@ async function reanalyzeSelectedRegion() {
 }
 
 async function segmentAll() {
+  if (!canEditCanvas()) return;
   const candidates = state.images.filter((image) => image.src.startsWith("data:image/") && !image.analyzed);
   if (!candidates.length) return showToast("队列中的图片都已分析，可继续人工调整", "warn");
   const batchButton = $("#segmentAllButton"); batchButton.disabled = true; batchButton.innerHTML = '<span class="spinner"></span>并发分析与审校中…';
@@ -1067,8 +1154,8 @@ function agentRegionsPayload(onlyImage = null) {
         holes: region.holes || [],
         editAction: region.editAction || "keep",
         x: region.x, y: region.y, w: region.w, h: region.h,
-        layoutX: Number.isFinite(region.layoutX) ? region.layoutX : 28,
-        layoutY: Number.isFinite(region.layoutY) ? region.layoutY : 28,
+        layoutX: Number.isFinite(region.layoutX) ? region.layoutX : 0,
+        layoutY: Number.isFinite(region.layoutY) ? region.layoutY : 0,
         layoutW: Number.isFinite(region.layoutW) ? region.layoutW : 1,
         layoutH: Number.isFinite(region.layoutH) ? region.layoutH : 1,
       });
@@ -1117,37 +1204,41 @@ async function autoLayoutWithAgent() {
   const renumberButton = $("#agentRenumberButton");
   const previousLabel = button.innerHTML;
   let finished = 0, total = 0;
-  if (state.agentLayoutRunning) return;
+  if (state.agentLayoutRunning || state.agentRenumberRunning) return;
   if (!state.images.length) return showToast("请先加入图片素材", "warn");
+  if (state.images.some((image) => image.supervisionPending)) return showToast("请等待分割审校完成后再自动排版", "warn");
   state.agentLayoutRunning = true;
   button.disabled = true; renumberButton.disabled = true;
+  updateCanvasLock();
   try {
     visualRegions();
     await Promise.all(state.images.map(ensureImageMetrics));
     normalizeLongLayout();
-    const images = state.images.filter((image) => layoutMaterialRegions(image).length);
-    total = images.length;
+    const queue = layoutRegionQueue();
+    total = queue.length;
     if (!total) throw new Error("没有可输出的内容块");
     pushHistory();
     const fixed = [];
-    reflowPendingMaterials(images, fixed);
-    for (const image of images) {
+    reflowPendingRegions(queue, fixed);
+    for (const entry of queue) {
+      const { image, region } = entry;
       const step = finished + 1;
       button.innerHTML = `<span class="spinner"></span>排版 ${step}/${total}`;
-      setProcessingStatus(`自动排版 ${step}/${total}：生成最新 PDF 排版图 · ${image.name}`);
-      const layoutViews = await buildLayoutViews(image, fixed);
       const signature = layoutEditSignature();
-      setProcessingStatus(`自动排版 ${step}/${total}：Qwen 定位当前素材 · ${image.name}`);
+      setProcessingStatus(`自动排版 ${step}/${total}：生成最新 PDF 排版图 · ${region.label || region.id}`);
+      const layoutViews = await buildLayoutViews(entry, fixed);
+      if (layoutEditSignature() !== signature) throw new Error("生成参考图期间分区已修改，请重新运行排版");
+      setProcessingStatus(`自动排版 ${step}/${total}：Qwen 定位分区 · ${region.label || region.id}（已完成 ${finished}）`);
       const response = await fetch("/api/agent-layout", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          canvasWidth: 800,
-          regions: agentRegionsPayload(image).filter((region) => region.editAction !== "delete"),
+          canvasWidth: CANVAS_WIDTH,
+          regions: agentRegionsPayload(image).filter((item) => item.id === region.id),
           layoutViews,
           layoutContext: {
-            step, total, imageId: image.id, imageName: image.name,
+            step, total, imageId: image.id, imageName: image.name, regionId: region.id,
             fixedBlocks: fixed.map(({ image: source, region }) => ({ id: region.id, imageId: source.id, group: region.group, x: region.layoutX, y: region.layoutY, w: region.layoutW, h: region.layoutH })),
-            pendingImageIds: images.slice(step).map((pending) => pending.id),
+            pendingRegionIds: queue.slice(step).map(({ image: source, region: pending }) => ({ imageId: source.id, id: pending.id, group: pending.group, w: pending.layoutW, h: pending.layoutH })),
           },
         }),
       });
@@ -1155,25 +1246,26 @@ async function autoLayoutWithAgent() {
       if (!response.ok) throw new Error(result.error || "排版请求失败");
       if (layoutEditSignature() !== signature) throw new Error("请求期间素材或画布已修改，已停止应用过期排版，请重新运行");
       const placements = result.placements;
-      const regions = layoutMaterialRegions(image);
-      if (!Array.isArray(placements) || placements.length !== regions.length || new Set(placements.map((item) => item.id)).size !== regions.length || placements.some((item) => !regions.some((region) => region.id === item.id) || item.imageId !== image.id)) throw new Error("排版返回的内容块不完整");
-      setProcessingStatus(`自动排版 ${step}/${total}：检查重叠、收紧空白并更新后续素材`);
-      applyCompactMaterialLayout(image, placements, fixed);
-      fixed.push(...regions.map((region) => ({ image, region })));
+      if (!Array.isArray(placements) || placements.length !== 1 || placements[0].id !== region.id || placements[0].imageId !== image.id || ![placements[0].x, placements[0].y].every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0) || placements[0].order !== 0) throw new Error("排版必须只返回当前分区的有效位置");
+      applyCompactRegionLayout(entry, placements[0], fixed);
+      fixed.push(entry);
       finished += 1;
-      reflowPendingMaterials(images.slice(finished), fixed);
+      reflowPendingRegions(queue.slice(finished), fixed);
       updateMaterialHomeLayouts();
-      render();
+      setSelection([entry]); render();
+      setProcessingStatus(`自动排版 ${finished}/${total}：已显示 ${region.label || region.id}，后续分区已避让`);
+      await displayLayoutStep(region);
     }
-    setProcessingStatus(`Agent 自动排版完成（${finished} 张素材，${fixed.length} 个块）`);
-    showToast(`已逐张完成 ${finished} 张素材的排版`, "success");
+    setProcessingStatus(`Agent 自动排版完成（${finished}/${total} 个分区）`);
+    showToast(`已逐分区完成 ${finished} 个分区的排版`, "success");
   } catch (error) {
-    setProcessingStatus(`自动排版已停止：完成 ${finished}/${total} 张，可撤销本次排版`);
+    setProcessingStatus(`自动排版已停止：完成 ${finished}/${total} 个分区，可撤销本次排版`);
     showToast(error.message || "自动排版失败", "error");
   } finally {
     state.agentLayoutRunning = false;
     button.disabled = false; renumberButton.disabled = false;
     button.innerHTML = previousLabel;
+    updateCanvasLock();
   }
 }
 
@@ -1181,12 +1273,32 @@ function layoutMaterialRegions(image) {
   return (image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : [])).filter((region) => region.editAction !== "delete");
 }
 
+function layoutRegionQueue() {
+  const entries = state.images.flatMap((image) => layoutMaterialRegions(image).map((region) => ({ image, region })));
+  entries.sort((a, b) => a.region.layoutY - b.region.layoutY || a.region.layoutX - b.region.layoutX);
+  const collections = new Map();
+  entries.forEach((entry) => {
+    const group = entry.region.group && entry.region.group !== "—" ? entry.region.group : regionKey(entry.image.id, entry.region.id);
+    if (!collections.has(group)) collections.set(group, []);
+    collections.get(group).push(entry);
+  });
+  return [...collections.values()].flat();
+}
+
+async function displayLayoutStep(region) {
+  const area = $("#canvasArea"), top = region.layoutY * state.zoom, bottom = (region.layoutY + region.layoutH) * state.zoom;
+  if (top < area.scrollTop || bottom > area.scrollTop + area.clientHeight) area.scrollTop = top;
+  // Two animation frames let the browser paint this result before generating
+  // the next request's raster images, rather than only painting at completion.
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
 function layoutEditSignature() {
   return JSON.stringify(state.images.map((image) => [image.id, image.src, (image.regions.length ? image.regions : [image.syntheticRegion]).map((region) => region && [region.id, region.group, region.label, region.editAction, region.polygon, region.holes, region.whiteoutPaths, region.whiteoutPolygons, region.layoutX, region.layoutY, region.layoutW, region.layoutH])]).concat([state.keepGroups, exportSettings()]));
 }
 
-function compactMaterialPlacements(regions, placements, fixed, canvasWidth = 800) {
-  const gap = 12, collectionGap = 16, margin = 24;
+function compactMaterialPlacements(regions, placements, fixed, canvasWidth = CANVAS_WIDTH) {
+  const gap = 0, collectionGap = 0, margin = 0;
   const byId = new Map(regions.map((region) => [region.id, region]));
   const ordered = [...placements].sort((a, b) => a.order - b.order);
   const groups = new Map();
@@ -1198,12 +1310,13 @@ function compactMaterialPlacements(regions, placements, fixed, canvasWidth = 800
     groups.get(group).push({ region, placement });
   });
   const occupied = fixed.map(({ region }) => ({ x: region.layoutX, y: region.layoutY, w: region.layoutW, h: region.layoutH, group: region.group }));
-  const lastFixed = [...occupied].sort((a, b) => b.y + b.h - a.y - a.h)[0];
+  const lastFixed = occupied[occupied.length - 1];
   let floor = occupied.length ? Math.max(...occupied.map((rect) => rect.y + rect.h)) + collectionGap : margin;
   const result = [];
   for (const [group, items] of groups) {
     if (!result.length && lastFixed?.group === group) floor = Math.min(...occupied.filter((rect) => rect.group === group).map((rect) => rect.y));
-    let previous = null, previousHintY = null;
+    let previous = !result.length && lastFixed?.group === group ? lastFixed : null;
+    let previousHintY = previous?.y ?? null;
     for (const { region, placement } of items) {
       const w = region.layoutW, h = region.layoutH, maxX = canvasWidth - w;
       if (!(w > 0 && h > 0) || maxX < margin) throw new Error("内容块超出画布宽度，请先调整素材尺寸");
@@ -1233,38 +1346,32 @@ function compactMaterialPlacements(regions, placements, fixed, canvasWidth = 800
   return result;
 }
 
-function applyCompactMaterialLayout(image, placements, fixed) {
-  const regions = layoutMaterialRegions(image);
-  const compacted = compactMaterialPlacements(regions, placements, fixed);
-  const byId = new Map(compacted.map((item) => [item.id, item]));
-  regions.forEach((region) => {
-    const placement = byId.get(region.id);
-    region.layoutX = placement.x; region.layoutY = placement.y;
-    region.zIndex = fixed.length + placement.order + 2; region.userMoved = true;
-  });
+function applyCompactRegionLayout({ region }, placement, fixed) {
+  const [compacted] = compactMaterialPlacements([region], [placement], fixed);
+  region.layoutX = compacted.x; region.layoutY = compacted.y;
+  region.zIndex = fixed.length + 2; region.userMoved = true;
 }
 
-function reflowPendingMaterials(images, fixed) {
+function reflowPendingRegions(entries, fixed) {
   const staged = [...fixed];
-  images.forEach((image) => {
-    const regions = layoutMaterialRegions(image);
-    const ordered = [...regions].sort((a, b) => a.layoutY - b.layoutY || a.layoutX - b.layoutX);
-    applyCompactMaterialLayout(image, ordered.map((region, order) => ({ id: region.id, x: region.layoutX, y: region.layoutY, order })), staged);
-    staged.push(...regions.map((region) => ({ image, region })));
+  entries.forEach((entry) => {
+    const { region } = entry;
+    applyCompactRegionLayout(entry, { id: region.id, x: region.layoutX, y: region.layoutY, order: 0 }, staged);
+    staged.push(entry);
   });
   // Deleted crops are excluded from PDF pages but remain editable on the canvas.
   // Park them after visible content, so they cannot obscure pending materials.
-  let tail = staged.reduce((bottom, { region }) => Math.max(bottom, region.layoutY + region.layoutH), 24) + 16;
+  let tail = staged.reduce((bottom, { region }) => Math.max(bottom, region.layoutY + region.layoutH), 0);
   state.images.forEach((image) => image.regions.filter((region) => region.editAction === "delete").forEach((region) => {
-    region.layoutX = 24; region.layoutY = tail; region.userMoved = true;
-    tail += region.layoutH + 12;
+    region.layoutX = 0; region.layoutY = tail; region.userMoved = true;
+    tail += region.layoutH;
   }));
   render();
 }
 
 function updateMaterialHomeLayouts() {
   state.images.forEach((image) => {
-    const regions = image.regions.length ? image.regions : [image.syntheticRegion];
+    const regions = (image.regions.length ? image.regions : [image.syntheticRegion]).filter(Boolean);
     if (!regions.length || regions.some((region) => !hasRegionLayout(region))) return;
     const top = Math.min(...regions.map((region) => region.layoutY));
     image.homePageHeight = Math.max(...regions.map((region) => region.layoutY + region.layoutH)) - top;
@@ -1273,6 +1380,9 @@ function updateMaterialHomeLayouts() {
 }
 
 async function autoRenumberWithAgent() {
+  if (state.agentLayoutRunning || state.agentRenumberRunning) return;
+  if (!canEditCanvas()) return;
+  state.agentRenumberRunning = true;
   const button = $("#agentRenumberButton");
   try {
     const result = await requestAgent("/api/agent-renumber", button, "重编号中…", "Qwen 正在识别题目集合顺序…");
@@ -1289,10 +1399,11 @@ async function autoRenumberWithAgent() {
   } catch (error) {
     setProcessingStatus("Agent 自动重编号未更改集合");
     showToast(error.message || "自动重编号失败", "error");
-  }
+  } finally { state.agentRenumberRunning = false; }
 }
 
 async function importWebpage() {
+  if (state.agentLayoutRunning) return showToast("请等待当前自动排版完成再导入素材", "warn");
   const input = $("#urlInput"); const url = input.value.trim(); if (!url) return showToast("请输入网页地址", "warn");
   $("#importUrlButton").disabled = true; $("#urlStatus").textContent = "正在读取网页中的图片资源…";
   try { const response = await fetch("/api/import-url", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || "网页读取失败"); const urls = result.imageUrls || []; if (!urls.length) { state.images.push(makeImage(`${result.title}.html`, demoImage(), { size: "网页内容", regions: structuredClone(demoRegions), analyzed: false, sourceUrl: result.url })); } else { const imported = await Promise.all(urls.slice(0, 6).map(async (src, index) => { try { const proxy = await fetch("/api/proxy-image", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: src }) }); const data = await proxy.json(); if (proxy.ok && data.data) return makeImage(`${result.title} · 图 ${index + 1}`, data.data, { size: "网页图片", sourceUrl: result.url }); } catch { /* keep remote fallback below */ } return makeImage(`${result.title} · 图 ${index + 1}`, src, { size: "网页图片", remote: true, sourceUrl: result.url }); })); state.images.push(...imported); } state.currentId = state.images[state.images.length - 1].id; render(); $("#urlStatus").textContent = `已导入 ${Math.max(urls.length, 1)} 个网页素材`; showToast("网页素材已加入队列", "success"); }
@@ -1304,6 +1415,7 @@ function resizePaintCanvas() { const canvas = $("#paintLayer"); const frame = $(
 function drawPaint() { const canvas = $("#paintLayer"); if (!canvas.width) return; canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height); }
 
 function clearWhiteouts() {
+  if (!canEditCanvas()) return;
   const entries = selectedRegionEntries();
   if (entries.length !== 1) return showToast("请先单选一个要清除涂白的内容块", "warn");
   const { region } = entries[0];
@@ -1311,16 +1423,22 @@ function clearWhiteouts() {
   pushHistory(); region.whiteoutPaths = []; region.whiteoutPolygons = []; region.cropSrc = null; render(); showToast("已清除当前内容块内的涂白", "success");
 }
 function deleteImage(imageId) {
+  if (!canEditCanvas()) return;
+  if (!state.images.some((image) => image.id === imageId)) return;
+  pushHistory(); removeImageData(imageId);
+  render(); showToast("素材图片已删除", "success");
+}
+function removeImageData(imageId) {
   const index = state.images.findIndex((image) => image.id === imageId); if (index < 0) return;
-  pushHistory(); state.images.splice(index, 1); delete state.whiteRects[imageId]; delete state.paintPaths[imageId];
+  state.images.splice(index, 1); delete state.whiteRects[imageId]; delete state.paintPaths[imageId];
   state.selectedRegionKeys = (state.selectedRegionKeys || []).filter((key) => !key.startsWith(`${imageId}::`));
   if (state.currentId === imageId) { const next = state.images[Math.min(index, state.images.length - 1)]; state.currentId = next?.id || null; state.selectedRegionId = next?.regions[0]?.id || null; state.selectedRegionKeys = next?.regions[0] ? [regionKey(next.id, next.regions[0].id)] : []; }
-  render(); showToast("素材图片已删除", "success");
 }
 function deleteRegion(imageId, regionId) { const image = state.images.find((item) => item.id === imageId); if (!image) return; const region = image.regions.find((item) => item.id === regionId); if (!region) return; image.regions = image.regions.filter((item) => item.id !== regionId); }
 function deleteSelected() {
+  if (!canEditCanvas()) return;
   const entries = selectedRegionEntries(); if (!entries.length) return showToast("请先选择一个内容块", "warn");
-  pushHistory(); entries.forEach(({ image, region }) => deleteRegion(image.id, region.id));
+  pushHistory(); entries.forEach(({ image, region }) => region.synthetic ? removeImageData(image.id) : deleteRegion(image.id, region.id));
   setSelection([]); render(); showToast(`已移除 ${entries.length} 个内容块`, "success");
 }
 
@@ -1336,7 +1454,7 @@ async function collectExportEntries(showProgress = true) {
   const entries = [];
   const totalImages = state.images.length;
   let imageIndex = 0;
-  let fallbackY = 28;
+  let fallbackY = 0;
   for (const image of state.images) {
     imageIndex += 1;
     if (showProgress) setProcessingStatus("正在裁剪第 " + imageIndex + "/" + totalImages + " 张素材…");
@@ -1345,21 +1463,21 @@ async function collectExportEntries(showProgress = true) {
       image.sourceWidth = size.width;
       image.sourceHeight = size.height;
       image.aspect = size.width && size.height ? size.width / size.height : .72;
-      image.displayScale = Math.min(1, 760 / Math.max(1, image.sourceWidth));
+      image.displayScale = Math.min(1, CANVAS_WIDTH / Math.max(1, image.sourceWidth));
     }
     const keptRegions = image.regions.filter((region) => region.editAction !== "delete");
     const regions = keptRegions.length ? keptRegions : (image.regions.length ? [] : [image.syntheticRegion || { id: "full", label: image.name, kind: "other", x: 0, y: 0, w: 100, h: 100, group: "未分组", confidence: 1 }]);
     for (const region of regions) {
-      const sourceWidth = image.sourceWidth || 760;
+      const sourceWidth = image.sourceWidth || CANVAS_WIDTH;
       const sourceHeight = image.sourceHeight || Math.round(sourceWidth / (image.aspect || .72));
-      const scale = image.displayScale || Math.min(1, 760 / Math.max(1, sourceWidth));
+      const scale = image.displayScale || Math.min(1, CANVAS_WIDTH / Math.max(1, sourceWidth));
       if (!Number.isFinite(region.layoutW) || !Number.isFinite(region.layoutH) || region.layoutW <= 0 || region.layoutH <= 0) {
         region.layoutW = Math.max(1, Math.round(sourceWidth * (Number(region.w) || 100) / 100 * scale));
         region.layoutH = Math.max(1, Math.round(sourceHeight * (Number(region.h) || 100) / 100 * scale));
       }
-      if (!Number.isFinite(region.layoutX)) region.layoutX = 28;
+      if (!Number.isFinite(region.layoutX)) region.layoutX = 0;
       if (!Number.isFinite(region.layoutY)) region.layoutY = fallbackY;
-      fallbackY = Math.max(fallbackY, region.layoutY + region.layoutH + 24);
+      fallbackY = Math.max(fallbackY, region.layoutY + region.layoutH);
       const group = state.keepGroups ? (region.group || region.id) : region.id;
       if (!region.cropSrc) region.cropSrc = await cropRegion(image, region);
       entries.push({ group, image, region, src: region.cropSrc, order: entries.length });
@@ -1371,7 +1489,7 @@ async function collectExportEntries(showProgress = true) {
 }
 
 function exportSettings() {
-  return { size: $("#pageSize").value, margin: Number($("#pageMargin").value) || 0 };
+  return { size: $("#pageSize").value, margin: 0 };
 }
 
 function createExportPlan(entries, settings = exportSettings()) {
@@ -1386,19 +1504,19 @@ function createExportPlan(entries, settings = exportSettings()) {
   const size = settings.size;
   const dimensions = { a4: [794, 1123], a3: [1123, 1587], letter: [816, 1056] };
   const [pageWidth, pageHeight] = dimensions[size] || dimensions.a4;
-  const pageMargin = clamp(Number(settings.margin) || 0, 0, Math.floor(Math.min(pageWidth, pageHeight) / 2));
+  const pageMargin = 0;
   const usableWidth = Math.max(1, pageWidth - pageMargin * 2);
   const usableHeight = Math.max(1, pageHeight - pageMargin * 2);
-  const canvasLeft = Math.min(...entries.map((entry) => Number.isFinite(entry.region.layoutX) ? entry.region.layoutX : 28));
+  const canvasLeft = entries.length ? Math.min(...entries.map((entry) => Number.isFinite(entry.region.layoutX) ? entry.region.layoutX : 0)) : 0;
   const canvasRight = Math.max(...entries.map((entry) => {
-    const left = Number.isFinite(entry.region.layoutX) ? entry.region.layoutX : 28;
+    const left = Number.isFinite(entry.region.layoutX) ? entry.region.layoutX : 0;
     return left + (Number.isFinite(entry.region.layoutW) ? entry.region.layoutW : 1);
   }));
   const terminalWidth = Math.max(1, canvasRight - canvasLeft);
   // Never enlarge a crop during export. A single horizontal scale keeps the
   // terminal-canvas proportions consistent across all pages.
   const terminalScale = Math.min(1, usableWidth / terminalWidth);
-  const groupGap = Math.max(0, Math.round(24 * terminalScale));
+  const groupGap = 0;
   const units = [...collections.values()].map((items) => {
     const groupTop = Math.min(...items.map((item) => Number.isFinite(item.region.layoutY) ? item.region.layoutY : 0));
     const groupBottom = Math.max(...items.map((item) => {
@@ -1499,14 +1617,15 @@ async function buildCropSheets(entries) {
   return sheets;
 }
 
-async function buildLayoutViews(image, fixed) {
+async function buildLayoutViews({ image, region }, fixed) {
   const entries = await collectExportEntries(false);
   const plan = createExportPlan(entries);
-  const pageIndices = new Set(plan.pages.filter((page) => page.blocks.some((block) => block.image.id === image.id)).map((page) => page.pageIndex));
-  // Include the current material's actual PDF pages and the previous completed
-  // material's last page. Older unrelated pages add tokens but no placement help.
-  const lastFixedImage = fixed[fixed.length - 1]?.image.id;
-  const previousPages = plan.pages.filter((page) => page.blocks.some((block) => block.image.id === lastFixedImage));
+  const isTarget = (block) => block.image.id === image.id && block.region.id === region.id;
+  const pageIndices = new Set(plan.pages.filter((page) => page.blocks.some(isTarget)).map((page) => page.pageIndex));
+  // Include the current region's actual PDF page and the last completed region's
+  // page, even when both regions come from the same source image.
+  const lastFixed = fixed[fixed.length - 1];
+  const previousPages = plan.pages.filter((page) => page.blocks.some((block) => block.image.id === lastFixed?.image.id && block.region.id === lastFixed?.region.id));
   if (previousPages.length) pageIndices.add(previousPages[previousPages.length - 1].pageIndex);
   const views = [];
   for (const pageIndex of [...pageIndices].sort((a, b) => a - b)) {
@@ -1521,7 +1640,7 @@ async function buildLayoutViews(image, fixed) {
       image: await rasterizeExportPage(page, plan),
     });
   }
-  views.push(...await buildCropSheets(entries.filter((entry) => entry.image.id === image.id)));
+  views.push(...await buildCropSheets(entries.filter(isTarget)));
   return views;
 }
 
@@ -1554,7 +1673,7 @@ function cropRegion(image, region) {
     const img = new Image();
     img.onload = () => {
       try {
-        const sourceWidth = img.naturalWidth || 760;
+        const sourceWidth = img.naturalWidth || CANVAS_WIDTH;
         const sourceHeight = img.naturalHeight || Math.round(sourceWidth / .72);
         const x = clamp(Number(region.x) || 0, 0, 100);
         const y = clamp(Number(region.y) || 0, 0, 100);

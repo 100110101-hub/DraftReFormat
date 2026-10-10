@@ -481,22 +481,22 @@ def _agent_visual_inputs(
 def agent_layout_prompt(regions: list[dict[str, Any]], canvas_width: int = 800, context: dict[str, Any] | None = None) -> str:
     """Prompt for Qwen's canvas arrangement agent."""
 
-    return """You are an automatic document layout agent for a semantic crop editor. This is ONE STEP of a sequential material-by-material layout. Arrange ONLY the supplied editable blocks from the current material on one continuous white canvas.
+    return """You are an automatic document layout agent for a semantic crop editor. This is ONE STEP of a sequential region-by-region layout. Position ONLY the ONE REGION supplied in INPUT BLOCKS on one continuous white canvas, even if its source material contains many other regions.
 
 The source blocks are already semantically segmented. Do not change their crop polygons, source coordinates, labels, kinds, or collection membership. Only choose their canvas x/y positions and their order.
 
 LAYOUT RULES
 1. Use CSS-pixel coordinates. The usable canvas width is """ + str(canvas_width) + """ px and vertical space is unlimited.
 2. Keep every supplied width and height exactly unchanged. Never scale a block, enlarge a block, or rotate a block.
-3. Blocks in the same group form one readable collection. Keep that collection contiguous, in a natural top-to-bottom reading order, with 12 px between blocks and 16 px between collections. Use side-by-side space when the content and unchanged widths permit it.
+3. Blocks in the same group form one readable collection. Keep that collection contiguous, in a natural top-to-bottom reading order. All page margins, canvas margins, block padding, and automatic gaps are ZERO pixels. Edge-touching rectangles are allowed; overlapping content is forbidden. Use side-by-side space when the content and unchanged widths permit it.
 4. Avoid overlap between unrelated blocks. Keep chemistry equations, mechanisms, figures, captions, and their related text together when their group says they belong together.
-5. Previous materials in fixedBlocks are already placed and must not move. Avoid their occupied rectangles. Later, pending materials are staging content and will be repositioned by the editor after this step; they are NOT fixed obstacles. Start near the end of the fixed content, filling available space in its final collection if the group matches. Never preserve a large blank gap merely because a pending source is far down the old canvas. Keep x >= 24, y >= 24, and x + the fixed width <= canvas width.
-6. Return every editable input block exactly once. Do not invent or remove IDs or return fixed/pending blocks. order is their final reading order.
-7. The editor will resolve collisions and compact unnecessary blank gaps while preserving sizes and your proposed reading order. The next request receives a freshly rendered PDF layout after your result has been applied.
+5. Previous regions in fixedBlocks are already placed and must not move. Avoid their occupied rectangles. Later, pending regions are staging content and will be repositioned by the editor after this step; they are NOT fixed obstacles. Start near the end of the fixed content, filling available space in its final collection if the group matches. Never preserve a large blank gap merely because a pending region is far down the old canvas. Keep x >= 0, y >= 0, and x + the fixed width <= canvas width. The first region can start at (0,0).
+6. Return exactly ONE placement for the editable input region. Do not invent or remove IDs or return fixed/pending blocks. order MUST be 0 for this single-region request.
+7. The editor will resolve collisions and compact unnecessary blank gaps while preserving sizes and your proposed reading order. It applies and visibly renders this region before building the next request and freshly rendered PDF layout for the next region.
 
 IMAGE GUIDE
 The pdf-page images are clean raster renders from the EXACT SAME page layout used by PDF export, including current crops, polygon holes, and per-block whiteouts. They contain no editor UI, boundary labels, or vertex marks. Use the supplied page manifest to map their page-pixel rectangles to region IDs. Page coordinates are NOT canvas coordinates: pagination, group relocation, and per-group scaling are described in the manifest. Output x/y in CANVAS CSS pixels only.
-The crop-sheet images show the current material's edited crops separately at readable resolution, even if some content overlaps or is tiny on a PDF page. Their ID/collection labels sit in a separate header outside the crop. They are reference sheets, NOT a proposed layout. Read them for semantics and use each block's fixed layoutW/layoutH for placement.
+The crop-sheet image shows ONLY the current region's edited crop at readable resolution, even if it is tiny on a PDF page. Its ID/collection label sits in a separate header outside the crop. It is a reference sheet, NOT a proposed layout. Read it for semantics and use the region's fixed layoutW/layoutH for placement.
 
 CURRENT STEP AND FIXED CANVAS CONTEXT
 """ + json.dumps(context or {}, ensure_ascii=False) + """
@@ -506,7 +506,7 @@ INPUT BLOCKS
 
 OUTPUT
 Return one strict JSON object only:
-{"placements":[{"id":"region-id","imageId":"image-id","x":24,"y":24,"order":0}]}
+{"placements":[{"id":"region-id","imageId":"image-id","x":0,"y":0,"order":0}]}
 
 Each placement must contain exactly id, imageId, x, y, and order. x/y/order are finite numbers; x and y are non-negative; order is a unique non-negative integer. Do not return width/height because those are fixed by the editor. No markdown, comments, explanations, or extra keys."""
 
@@ -689,8 +689,8 @@ def run_agent_operation(payload: dict[str, Any], operation: str) -> tuple[dict[s
 
     regions = _agent_request_regions(payload)
     if operation == "layout":
-        if len({region["imageId"] for region in regions}) != 1:
-            raise ValueError("每次自动排版只能处理一张素材")
+        if len(regions) != 1:
+            raise ValueError("每次自动排版只能处理一个分区")
         visual_inputs, visual_manifest = _agent_layout_views(payload)
         context = payload.get("layoutContext")
         if not isinstance(context, dict):

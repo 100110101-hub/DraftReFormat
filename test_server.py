@@ -55,10 +55,9 @@ class StructuredOutputTests(unittest.TestCase):
         payload = {
             "regions": [
                 {"id": "r1", "imageId": "img1", "imageName": "draft.png", "label": "Question", "kind": "text", "group": "Q1", "layoutX": 28, "layoutY": 28, "layoutW": 200, "layoutH": 100},
-                {"id": "r2", "imageId": "img1", "imageName": "draft.png", "label": "Figure", "kind": "image", "group": "Q1", "layoutX": 28, "layoutY": 152, "layoutW": 240, "layoutH": 180},
             ],
             "images": [],
-            "layoutContext": {"step": 2, "total": 3, "fixedBlocks": [{"id": "previous", "x": 24, "y": 24, "w": 200, "h": 100}], "pendingImageIds": ["img3"]},
+            "layoutContext": {"step": 2, "total": 3, "regionId": "r1", "fixedBlocks": [{"id": "previous", "x": 0, "y": 0, "w": 200, "h": 100}], "pendingRegionIds": [{"imageId": "img1", "id": "r2"}]},
             "layoutViews": [
                 {"kind": "pdf-page", "pageIndex": 0, "width": 794, "height": 1123, "blocks": [], "image": "data:image/png;base64,cGRm"},
                 {"kind": "crop-sheet", "width": 800, "height": 320, "blocks": [], "image": "data:image/png;base64,Y3JvcA=="},
@@ -72,8 +71,7 @@ class StructuredOutputTests(unittest.TestCase):
             captured["model"] = kwargs.get("model")
             return {
                 "placements": [
-                    {"id": "r1", "imageId": "img1", "x": 24, "y": 24, "order": 0},
-                    {"id": "r2", "imageId": "img1", "x": 24, "y": 148, "order": 1},
+                    {"id": "r1", "imageId": "img1", "x": 0, "y": 100, "order": 0},
                 ]
             }, None
 
@@ -91,21 +89,25 @@ class StructuredOutputTests(unittest.TestCase):
                 with urllib.request.urlopen(request, timeout=5) as response:
                     result = json.loads(response.read().decode())
             self.assertEqual(result["source"], "qwen-agent")
-            self.assertEqual(len(result["placements"]), 2)
+            self.assertEqual(len(result["placements"]), 1)
             self.assertEqual(captured["model"], server.QWEN_MODEL)
             self.assertIn("already semantically segmented", captured["prompt"])
             self.assertEqual(captured["images"], [view["image"] for view in payload["layoutViews"]])
             self.assertIn("ONE STEP", captured["prompt"])
             self.assertIn("EXACT SAME page layout", captured["prompt"])
-            self.assertIn('"pendingImageIds": ["img3"]', captured["prompt"])
+            self.assertIn("ONE REGION", captured["prompt"])
+            self.assertIn("ZERO pixels", captured["prompt"])
+            self.assertIn('"pendingRegionIds": [{"imageId": "img1", "id": "r2"}]', captured["prompt"])
         finally:
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=2)
 
     def test_layout_rejects_whole_project_or_missing_pdf_views(self) -> None:
-        with self.assertRaisesRegex(ValueError, "一张素材"):
+        with self.assertRaisesRegex(ValueError, "一个分区"):
             server.run_agent_operation({"regions": [{"id": "r1", "imageId": "img1"}, {"id": "r2", "imageId": "img2"}]}, "layout")
+        with self.assertRaisesRegex(ValueError, "一个分区"):
+            server.run_agent_operation({"regions": [{"id": "r1", "imageId": "img1"}, {"id": "r2", "imageId": "img1"}]}, "layout")
         with self.assertRaisesRegex(ValueError, "PDF"):
             server._agent_layout_views({"layoutViews": [{"kind": "crop-sheet", "image": "data:image/png;base64,eA=="}]})
 

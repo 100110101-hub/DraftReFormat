@@ -34,6 +34,67 @@ def valid_supervisor_payload() -> dict:
 
 
 class StructuredOutputTests(unittest.TestCase):
+    def test_agent_layout_and_renumber_schemas_are_complete(self) -> None:
+        regions = [
+            {"id": "r1", "imageId": "img1", "layoutW": 240, "layoutH": 120},
+            {"id": "r2", "imageId": "img1", "layoutW": 180, "layoutH": 90},
+        ]
+        placements = {
+            "placements": [
+                {"id": "r1", "imageId": "img1", "x": 24, "y": 24, "order": 0},
+                {"id": "r2", "imageId": "img1", "x": 24, "y": 168, "order": 1},
+            ]
+        }
+        assignments = {"assignments": [{"id": "r1", "group": "Q1"}, {"id": "r2", "group": "Q2"}]}
+        self.assertEqual(server.validate_agent_layout_response(placements, regions), [])
+        self.assertEqual(server.validate_agent_renumber_response(assignments, regions), [])
+        self.assertTrue(server.validate_agent_layout_response({"placements": placements["placements"][:1]}, regions))
+        self.assertTrue(server.validate_agent_renumber_response({"assignments": [{"id": "r1", "group": "Q2"}, {"id": "r2", "group": "Q4"}]}, regions))
+
+    def test_agent_layout_endpoint_uses_configured_qwen_and_returns_positions(self) -> None:
+        payload = {
+            "regions": [
+                {"id": "r1", "imageId": "img1", "imageName": "draft.png", "label": "Question", "kind": "text", "group": "Q1", "layoutX": 28, "layoutY": 28, "layoutW": 200, "layoutH": 100},
+                {"id": "r2", "imageId": "img1", "imageName": "draft.png", "label": "Figure", "kind": "image", "group": "Q1", "layoutX": 28, "layoutY": 152, "layoutW": 240, "layoutH": 180},
+            ],
+            "images": [],
+        }
+        captured: dict = {}
+
+        def fake_request(images, prompt, *args, **kwargs):
+            captured["images"] = images
+            captured["prompt"] = prompt
+            captured["model"] = kwargs.get("model")
+            return {
+                "placements": [
+                    {"id": "r1", "imageId": "img1", "x": 24, "y": 24, "order": 0},
+                    {"id": "r2", "imageId": "img1", "x": 24, "y": 148, "order": 1},
+                ]
+            }, None
+
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{httpd.server_port}/api/agent-layout",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with patch("server.qwen_request", side_effect=fake_request):
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    result = json.loads(response.read().decode())
+            self.assertEqual(result["source"], "qwen-agent")
+            self.assertEqual(len(result["placements"]), 2)
+            self.assertEqual(captured["model"], server.QWEN_MODEL)
+            self.assertIn("already semantically segmented", captured["prompt"])
+            self.assertEqual(captured["images"], [])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
     def test_reanalysis_endpoint_sends_boundary_overlay_and_accepts_corrected_polygon(self) -> None:
         current = [[40, 40], [60, 40], [60, 60], [40, 60]]
         corrected = [[41, 41], [58, 40], [59, 57], [43, 59]]

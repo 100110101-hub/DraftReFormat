@@ -409,6 +409,253 @@ def qwen_request(
         return None, QWEN_LAST_ERROR
 
 
+def _agent_region_with_polygon(region: dict[str, Any]) -> dict[str, Any]:
+    """Give an agent a drawable polygon even for legacy rectangular regions."""
+
+    item = dict(region)
+    polygon = item.get("polygon")
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        try:
+            x, y = float(item.get("x", 0)), float(item.get("y", 0))
+            w, h = float(item.get("w", 1)), float(item.get("h", 1))
+            item["polygon"] = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        except (TypeError, ValueError):
+            pass
+    return item
+
+
+def _agent_visual_inputs(
+    images: list[dict[str, Any]],
+    regions: list[dict[str, Any]],
+) -> list[str]:
+    """Render each source with the same two boundary views used by supervision."""
+
+    visual_inputs: list[str] = []
+    for image in images[:8]:
+        image_data = image.get("image")
+        image_id = str(image.get("id") or "")
+        if not isinstance(image_data, str) or not image_data.startswith("data:image/"):
+            continue
+        proposal = [
+            _agent_region_with_polygon(region)
+            for region in regions
+            if str(region.get("imageId") or "") == image_id
+        ]
+        try:
+            visual_inputs.extend(make_supervision_images(image_data, proposal))
+        except Exception:
+            # Remote images or environments without Pillow can still use the
+            # structured region metadata, so keep the original as a fallback.
+            visual_inputs.append(image_data)
+    return visual_inputs[:16]
+
+
+def agent_layout_prompt(regions: list[dict[str, Any]], canvas_width: int = 800) -> str:
+    """Prompt for Qwen's canvas arrangement agent."""
+
+    return """You are an automatic document layout agent for a semantic crop editor. Arrange the already-cropped content blocks on one continuous white canvas.
+
+The source blocks are already semantically segmented. Do not change their crop polygons, source coordinates, labels, kinds, or collection membership. Only choose their canvas x/y positions and their order.
+
+LAYOUT RULES
+1. Use CSS-pixel coordinates. The usable canvas width is """ + str(canvas_width) + """ px and vertical space is unlimited.
+2. Keep every supplied width and height exactly unchanged. Never scale a block, enlarge a block, or rotate a block.
+3. Blocks in the same group form one readable collection. Keep that collection contiguous, in a natural top-to-bottom reading order, with a modest gap between collections.
+4. Avoid overlap between unrelated blocks. Keep chemistry equations, mechanisms, figures, captions, and their related text together when their group says they belong together.
+5. Preserve the current order as a strong hint, but repair obvious collisions, excessive whitespace, and blocks placed outside the canvas. Keep x >= 24 and y >= 24.
+6. Return every input block exactly once. Do not invent or remove IDs. The array order is the final front-to-back/read order.
+
+INPUT BLOCKS
+""" + json.dumps(regions, ensure_ascii=False) + """
+
+OUTPUT
+Return one strict JSON object only:
+{"placements":[{"id":"region-id","imageId":"image-id","x":24,"y":24,"order":0}]}
+
+Each placement must contain exactly id, imageId, x, y, and order. x/y/order are finite numbers; x and y are non-negative; order is a unique non-negative integer. Do not return width/height because those are fixed by the editor. No markdown, comments, explanations, or extra keys."""
+
+
+def agent_renumber_prompt(regions: list[dict[str, Any]]) -> str:
+    """Prompt for Qwen's semantic collection renumbering agent."""
+
+    return """You are an automatic question-number and collection-renumbering agent for a document editor.
+
+Infer the logical reading order and collection membership from the supplied source previews and region metadata. Assign clean sequential collection IDs. Use Q1, Q2, Q3, ... in top-to-bottom reading order, with one shared group for all parts of the same question or figure collection.
+
+RENUMBER RULES
+1. Return every input region exactly once. Never omit, duplicate, split, or invent an ID.
+2. Regions with the same logical question, figure, caption, answer, reaction, or correction must receive the same group.
+3. Keep a chemical equation, mechanism, reaction pathway, and connected conditions in one group. Keep deletion/correction regions in the same group as the material they modify.
+4. Use current group IDs, labels, descriptions, image order, and visible numbered text as evidence. Do not renumber merely by the current arbitrary group spelling.
+5. The first logical collection is Q1, the next is Q2, and so on. Do not skip numbers.
+6. Do not change labels, kinds, polygons, crop coordinates, or canvas positions. Only return the new group assignment.
+
+INPUT REGIONS
+""" + json.dumps(regions, ensure_ascii=False) + """
+
+OUTPUT
+Return one strict JSON object only:
+{"assignments":[{"id":"region-id","group":"Q1"}]}
+
+Each assignment must contain exactly id and group. group must be a non-empty string matching Q followed by a positive integer. No markdown, comments, explanations, or extra keys."""
+
+
+def validate_agent_layout_response(payload: Any, regions: list[dict[str, Any]]) -> list[str]:
+    """Validate the complete placement list returned by the layout agent."""
+
+    if not isinstance(payload, dict) or set(payload) != {"placements"}:
+        return ["自动排版必须只返回 placements"]
+    placements = payload.get("placements")
+    if not isinstance(placements, list) or len(placements) != len(regions):
+        return ["自动排版必须为每个区域返回一个 placement"]
+    source_ids = [str(region.get("id") or "") for region in regions]
+    source_images = {str(region.get("id") or ""): str(region.get("imageId") or "") for region in regions}
+    if any(not region_id for region_id in source_ids) or len(set(source_ids)) != len(source_ids):
+        return ["输入区域 ID 不唯一"]
+    seen: set[str] = set()
+    orders: set[int] = set()
+    allowed = {"id", "imageId", "x", "y", "order"}
+    for index, placement in enumerate(placements):
+        if not isinstance(placement, dict):
+            return [f"placements[{index}] 必须是对象"]
+        if set(placement) != allowed:
+            return [f"placements[{index}] 字段不符合排版 schema"]
+        region_id = str(placement.get("id") or "")
+        if region_id not in source_ids or region_id in seen:
+            return [f"placements[{index}].id 无效或重复"]
+        seen.add(region_id)
+        if placement.get("imageId") != source_images[region_id]:
+            return [f"placements[{index}].imageId 与区域不匹配"]
+        for key in ("x", "y", "order"):
+            value = placement.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                return [f"placements[{index}].{key} 必须是有限数字"]
+            if key != "order" and float(value) < 0:
+                return [f"placements[{index}].{key} 不能为负数"]
+        order = int(placement["order"])
+        if float(placement["order"]) != order or order < 0 or order in orders:
+            return [f"placements[{index}].order 必须是唯一非负整数"]
+        orders.add(order)
+        if not isinstance(placement.get("imageId"), str) or not placement["imageId"]:
+            return [f"placements[{index}].imageId 必须是非空字符串"]
+    if seen != set(source_ids) or orders != set(range(len(regions))):
+        return ["自动排版返回的区域集合或顺序不完整"]
+    return []
+
+
+def validate_agent_renumber_response(payload: Any, regions: list[dict[str, Any]]) -> list[str]:
+    """Validate the complete collection assignment list."""
+
+    if not isinstance(payload, dict) or set(payload) != {"assignments"}:
+        return ["自动重编号必须只返回 assignments"]
+    assignments = payload.get("assignments")
+    if not isinstance(assignments, list) or len(assignments) != len(regions):
+        return ["自动重编号必须为每个区域返回一个 assignment"]
+    source_ids = {str(region.get("id") or "") for region in regions}
+    seen: set[str] = set()
+    for index, assignment in enumerate(assignments):
+        if not isinstance(assignment, dict) or set(assignment) != {"id", "group"}:
+            return [f"assignments[{index}] 字段不符合重编号 schema"]
+        region_id = str(assignment.get("id") or "")
+        group = assignment.get("group")
+        if region_id not in source_ids or region_id in seen:
+            return [f"assignments[{index}].id 无效或重复"]
+        if not isinstance(group, str) or not re.fullmatch(r"Q[1-9][0-9]*", group):
+            return [f"assignments[{index}].group 必须是 Q1、Q2 等连续编号格式"]
+        seen.add(region_id)
+    if seen != source_ids:
+        return ["自动重编号返回的区域集合不完整"]
+    groups = sorted({int(assignment["group"][1:]) for assignment in assignments})
+    if groups != list(range(1, max(groups, default=0) + 1)):
+        return ["自动重编号的 Q 编号不能跳号"]
+    return []
+
+
+def _agent_request_regions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep agent requests bounded and remove editor-only crop data."""
+
+    raw_regions = payload.get("regions")
+    if not isinstance(raw_regions, list) or not raw_regions or len(raw_regions) > 80:
+        raise ValueError("需要 1–80 个内容区域")
+    regions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_regions:
+        if not isinstance(raw, dict):
+            continue
+        region_id = str(raw.get("id") or "").strip()
+        image_id = str(raw.get("imageId") or "").strip()
+        if not region_id or not image_id or region_id in seen:
+            continue
+        seen.add(region_id)
+        item = {
+            "id": region_id,
+            "imageId": image_id,
+            "imageName": str(raw.get("imageName") or "")[:160],
+            "label": str(raw.get("label") or "Semantic Region")[:80],
+            "kind": str(raw.get("kind") or "other"),
+            "group": str(raw.get("group") or "")[:80],
+            "description": str(raw.get("description") or "")[:160],
+            "polygon": raw.get("polygon") if isinstance(raw.get("polygon"), list) else None,
+            "layoutX": raw.get("layoutX", 0),
+            "layoutY": raw.get("layoutY", 0),
+            "layoutW": raw.get("layoutW", 1),
+            "layoutH": raw.get("layoutH", 1),
+        }
+        regions.append(item)
+    if len(regions) != len(raw_regions):
+        raise ValueError("内容区域必须包含唯一的 id 和 imageId")
+    return regions
+
+
+def _agent_request_images(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_images = payload.get("images")
+    if not isinstance(raw_images, list):
+        return []
+    images: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_images[:8]:
+        if not isinstance(raw, dict):
+            continue
+        image_id = str(raw.get("id") or "").strip()
+        image_data = raw.get("image")
+        if not image_id or image_id in seen or not isinstance(image_data, str) or not image_data.startswith("data:image/"):
+            continue
+        seen.add(image_id)
+        images.append({"id": image_id, "name": str(raw.get("name") or "")[:160], "image": image_data})
+    return images
+
+
+def run_agent_operation(payload: dict[str, Any], operation: str) -> tuple[dict[str, Any] | None, int, str | None]:
+    """Execute one of the two Qwen 3.8 flash editor agents."""
+
+    regions = _agent_request_regions(payload)
+    images = _agent_request_images(payload)
+    visual_inputs = _agent_visual_inputs(images, regions)
+    visual_manifest = [
+        {"imageId": image["id"], "name": image["name"], "views": ["compact boundary overlay", "enlarged 0-100 coordinate overlay"]}
+        for image in images
+    ]
+    if operation == "layout":
+        prompt = agent_layout_prompt(regions, int(payload.get("canvasWidth") or 800)) + "\n\nVISUAL INPUT ORDER\n" + json.dumps(visual_manifest, ensure_ascii=False)
+        parsed, error = qwen_request(visual_inputs, prompt, model=QWEN_MODEL)
+        if error:
+            return None, 502, "自动排版请求失败：" + error
+        issues = validate_agent_layout_response(parsed, regions)
+        if issues:
+            return None, 422, "自动排版返回格式无效：" + issues[0]
+        return {"placements": parsed["placements"], "model": QWEN_MODEL, "source": "qwen-agent"}, 200, None
+    if operation == "renumber":
+        prompt = agent_renumber_prompt(regions) + "\n\nVISUAL INPUT ORDER\n" + json.dumps(visual_manifest, ensure_ascii=False)
+        parsed, error = qwen_request(visual_inputs, prompt, model=QWEN_MODEL)
+        if error:
+            return None, 502, "自动重编号请求失败：" + error
+        issues = validate_agent_renumber_response(parsed, regions)
+        if issues:
+            return None, 422, "自动重编号返回格式无效：" + issues[0]
+        return {"assignments": parsed["assignments"], "model": QWEN_MODEL, "source": "qwen-agent"}, 200, None
+    return None, 400, "未知 Agent 操作"
+
+
 def segmentation_prompt(hint: str = "") -> str:
     return """You are a document-layout and semantic-cropping agent. Analyze the supplied draft image and return every independently editable semantic region for downstream cropping and pagination. The geometry contract is polygons only. Trace the actual content silhouette; do not substitute loose bounding rectangles or axis-aligned boxes.
 
@@ -1263,6 +1510,14 @@ class Handler(BaseHTTPRequestHandler):
                     json_response(self, {"error": "原位重分析结果无效：" + issues[0]}, 422)
                     return
                 json_response(self, {"polygon": parsed["polygon"], "model": QWEN_MODEL})
+                return
+            if self.path in {"/api/agent-layout", "/api/agent-renumber"}:
+                operation = "layout" if self.path.endswith("layout") else "renumber"
+                result, status, error = run_agent_operation(payload, operation)
+                if error:
+                    json_response(self, {"error": error, "model": QWEN_MODEL}, status)
+                else:
+                    json_response(self, result)
                 return
             if self.path == "/api/import-url":
                 result = import_url(str(payload.get("url", "")))

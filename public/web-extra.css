@@ -3,6 +3,11 @@
 .spinner { width: 10px; height: 10px; border: 1px solid #9c8eff; border-top-color: transparent; display: inline-block; border-radius: 50%; animation: spin .7s linear infinite; }
 .ai-batch-button { width: 100%; margin-top: 7px; padding: 6px; border-radius: 5px; color: #8e86ad; background: transparent; border: 1px solid #343047; font-size: 9px; }
 .ai-batch-button:hover { border-color: #6557a0; color: #c4b7ff; }
+.agent-action-row { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 7px; }
+.agent-action-button { min-width: 0; padding: 7px 5px; border: 1px solid #384052; border-radius: 5px; color: #a9b2c2; background: #171c25; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-action-button span { color: #bbaaff; margin-right: 3px; }
+.agent-action-button:hover:not(:disabled) { border-color: #6b5bc4; color: #e0d9ff; background: #25213b; }
+.agent-action-button:disabled { opacity: .55; cursor: wait; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* The editor surface is a real, white, continuous canvas. Content blocks are

@@ -510,6 +510,8 @@ function bindEvents() {
   $("#htmlInput").addEventListener("change", (event) => handleHtmlFiles([...event.target.files]));
   $("#segmentButton").addEventListener("click", segmentCurrent);
   $("#segmentAllButton").addEventListener("click", segmentAll);
+  $("#agentLayoutButton").addEventListener("click", autoLayoutWithAgent);
+  $("#agentRenumberButton").addEventListener("click", autoRenumberWithAgent);
   $("#importUrlButton").addEventListener("click", importWebpage);
   $("#urlInput").addEventListener("keydown", (event) => { if (event.key === "Enter") importWebpage(); });
   $("#undoButton").addEventListener("click", undo); $("#redoButton").addEventListener("click", redo);
@@ -1034,6 +1036,115 @@ async function segmentAll() {
     }));
     render(); setProcessingStatus("已完成 " + results.length + " 张图片的最终分区"); showToast(`已并发完成 ${results.length} 张图片的语义分区`, "success");
   } finally { batchButton.disabled = false; batchButton.textContent = "批量分析素材队列"; }
+}
+
+function agentRegionsPayload() {
+  const regions = [];
+  state.images.forEach((image) => {
+    const sourceRegions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
+    sourceRegions.forEach((region) => {
+      if (!region?.id) return;
+      regions.push({
+        id: region.id,
+        imageId: image.id,
+        imageName: image.name,
+        label: region.label || image.name,
+        kind: region.kind || "other",
+        group: region.group || "",
+        description: region.description || "",
+        polygon: Array.isArray(region.polygon) ? region.polygon : null,
+        layoutX: Number.isFinite(region.layoutX) ? region.layoutX : 28,
+        layoutY: Number.isFinite(region.layoutY) ? region.layoutY : 28,
+        layoutW: Number.isFinite(region.layoutW) ? region.layoutW : 1,
+        layoutH: Number.isFinite(region.layoutH) ? region.layoutH : 1,
+      });
+    });
+  });
+  return regions;
+}
+
+function agentImagesPayload() {
+  return state.images
+    .filter((image) => typeof image.src === "string" && image.src.startsWith("data:image/"))
+    .slice(0, 8)
+    .map((image) => ({ id: image.id, name: image.name, image: image.src }));
+}
+
+async function requestAgent(path, button, workingLabel, statusLabel) {
+  const regions = agentRegionsPayload();
+  if (!regions.length) throw new Error("请先加入或分析至少一个内容块");
+  const previousLabel = button.innerHTML;
+  button.disabled = true;
+  button.innerHTML = `<span class="spinner"></span>${workingLabel}`;
+  setProcessingStatus(statusLabel);
+  try {
+    await Promise.all(state.images.map(ensureImageMetrics));
+    normalizeLongLayout();
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        canvasWidth: 800,
+        images: agentImagesPayload(),
+        regions: agentRegionsPayload(),
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Agent 请求失败");
+    return result;
+  } finally {
+    button.disabled = false;
+    button.innerHTML = previousLabel;
+  }
+}
+
+async function autoLayoutWithAgent() {
+  const button = $("#agentLayoutButton");
+  try {
+    const result = await requestAgent("/api/agent-layout", button, "排版中…", "Qwen 正在按集合整理长画布…");
+    const placements = Array.isArray(result.placements) ? result.placements : [];
+    const byId = new Map(placements.map((placement) => [placement.id, placement]));
+    const ordered = [...placements].sort((a, b) => Number(a.order) - Number(b.order));
+    pushHistory();
+    state.images.forEach((image) => {
+      const regions = image.regions.length ? image.regions : (image.syntheticRegion ? [image.syntheticRegion] : []);
+      regions.forEach((region) => {
+        const placement = byId.get(region.id);
+        if (!placement) return;
+        region.layoutX = Math.max(8, Number(placement.x) || 8);
+        region.layoutY = Math.max(8, Number(placement.y) || 8);
+        region.zIndex = ordered.findIndex((item) => item.id === region.id) + 2;
+        region.userMoved = true;
+      });
+    });
+    captureHomePageLayout();
+    render();
+    setProcessingStatus(`Agent 自动排版完成（${placements.length} 个块）`);
+    showToast(`Qwen 已完成自动排版（${placements.length} 个块）`, "success");
+  } catch (error) {
+    setProcessingStatus("Agent 自动排版未更改画布");
+    showToast(error.message || "自动排版失败", "error");
+  }
+}
+
+async function autoRenumberWithAgent() {
+  const button = $("#agentRenumberButton");
+  try {
+    const result = await requestAgent("/api/agent-renumber", button, "重编号中…", "Qwen 正在识别题目集合顺序…");
+    const assignments = Array.isArray(result.assignments) ? result.assignments : [];
+    const byId = new Map(assignments.map((assignment) => [assignment.id, assignment.group]));
+    pushHistory();
+    state.images.forEach((image) => image.regions.forEach((region) => {
+      const group = byId.get(region.id);
+      if (group) region.group = group;
+    }));
+    render();
+    setProcessingStatus(`Agent 自动重编号完成（${new Set(assignments.map((item) => item.group)).size} 个集合）`);
+    showToast("Qwen 已按语义阅读顺序完成自动重编号", "success");
+  } catch (error) {
+    setProcessingStatus("Agent 自动重编号未更改集合");
+    showToast(error.message || "自动重编号失败", "error");
+  }
 }
 
 async function importWebpage() {
